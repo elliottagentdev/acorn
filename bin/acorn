@@ -4,8 +4,10 @@ IFS=$'\n\t'
 
 SCRIPT_NAME="acorn"
 PROJECTS_DIR="${PROJECTS_DIR:-$HOME/projects}"
-LIFECYCLE_LABELS=("triage" "ready-for-spec" "spec-in-progress" "spec-review" "spec-approved" "implementing" "in-review" "done")
+LIFECYCLE_LABELS=("triage" "ready-for-spec" "spec-in-progress" "spec-review" "spec-approved" "implementing" "in-review" "review-pass" "review-blocked" "review-skipped" "done")
 CLARIFICATION_LABELS=("ai-drafted" "human-clarified")
+TELEGRAM_NOTIFY_PORT="${TELEGRAM_NOTIFY_PORT:-8765}"
+TELEGRAM_NOTIFY_URL="http://127.0.0.1:${TELEGRAM_NOTIFY_PORT}/notify"
 _SHOW_DEPS=0
 _LIST_NWO=""
 auto_trigger_message() {
@@ -22,6 +24,32 @@ info() { printf '[INFO] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
 die() { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
 
+notify_telegram() {
+  local message="$1"
+  local session="${2:-}"
+
+  # Fire-and-forget: never block acorn on notification failure
+  (
+    if ! command -v curl >/dev/null 2>&1; then
+      return 0
+    fi
+
+    local payload
+    if [ -n "$session" ]; then
+      payload="$(jq -nc --arg m "$message" --arg s "$session" '{message: $m, session: $s}')"
+    else
+      payload="$(jq -nc --arg m "$message" '{message: $m}')"
+    fi
+
+    curl -fsS --max-time 5 \
+      -H "Content-Type: application/json" \
+      -d "$payload" \
+      "$TELEGRAM_NOTIFY_URL" >/dev/null 2>&1 \
+      || true
+  ) &
+  disown
+}
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -31,6 +59,7 @@ Usage:
   acorn approve <repo> <slug>
   acorn spec-complete <repo> <slug>
   acorn clean <repo> <slug> [--remove-labels] [--yes] [--force]
+  acorn doctor [repo]
   acorn issue create <repo> <title> [--body <text> | --body-file <path> | --raw] [--label <name>]... [--assignee <login>]... [--blocked-by <issue#>[,<issue#>...]]
   acorn issue plan <repo> <title> [options] [--blocked-by <issue#>[,<issue#>...]] [--no-auto] [--lite | --quick]
   acorn issue clarify <repo> <issue-number>
@@ -70,7 +99,13 @@ require_cmds() {
 
 repo_main_path() {
   local repo="$1"
-  printf '%s/%s/main' "$PROJECTS_DIR" "$repo"
+  local worktree_path="$PROJECTS_DIR/$repo/main"
+  local flat_path="$PROJECTS_DIR/$repo"
+  if [ -d "$worktree_path" ]; then
+    printf '%s' "$worktree_path"
+  else
+    printf '%s' "$flat_path"
+  fi
 }
 
 spec_root() {
@@ -145,10 +180,9 @@ truncate_str() {
 gh_issue_json() {
   local repo_main="$1"
   local issue_number="$2"
-  (
-    cd "$repo_main"
-    gh issue view "$issue_number" --json number,title,body,labels,comments,url,assignees
-  )
+  local nwo
+  nwo="$(gh_repo_nwo "$repo_main")"
+  gh issue view "$issue_number" --repo "$nwo" --json number,title,body,labels,comments,url,assignees
 }
 
 ensure_labels() {
@@ -164,22 +198,22 @@ ensure_labels() {
   lifecycle_colors="$lifecycle_colors spec-approved:0052cc"
   lifecycle_colors="$lifecycle_colors implementing:5319e7"
   lifecycle_colors="$lifecycle_colors in-review:f9d0c4"
+  lifecycle_colors="$lifecycle_colors review-pass:0e8a16"
+  lifecycle_colors="$lifecycle_colors review-blocked:d73a4a"
+  lifecycle_colors="$lifecycle_colors review-skipped:e4e669"
   lifecycle_colors="$lifecycle_colors done:cccccc"
+
+  local nwo
+  nwo="$(gh_repo_nwo "$repo_main")"
 
   for label in "${LIFECYCLE_LABELS[@]}"; do
     color="$(printf '%s' "$lifecycle_colors" | tr ' ' '\n' | grep "^${label}:" | cut -d: -f2)"
     [ -n "$color" ] || color="0052cc"
-    (
-      cd "$repo_main"
-      gh label create "$label" --color "$color" --description "Acorn lifecycle" --force >/dev/null 2>&1
-    ) || true
+    gh label create "$label" --repo "$nwo" --color "$color" --description "Acorn lifecycle" --force >/dev/null 2>&1 || true
   done
 
   for label in "${CLARIFICATION_LABELS[@]}"; do
-    (
-      cd "$repo_main"
-      gh label create "$label" --color "e4e669" --description "Acorn clarification status" --force >/dev/null 2>&1
-    ) || true
+    gh label create "$label" --repo "$nwo" --color "e4e669" --description "Acorn clarification status" --force >/dev/null 2>&1 || true
   done
 }
 
@@ -187,20 +221,20 @@ remove_issue_label_soft() {
   local repo_main="$1"
   local issue_number="$2"
   local label="$3"
-  (
-    cd "$repo_main"
-    gh issue edit "$issue_number" --remove-label "$label" >/dev/null 2>&1
-  ) || warn "Unable to remove label '$label' from issue #$issue_number"
+  local nwo
+  nwo="$(gh_repo_nwo "$repo_main")"
+  gh issue edit "$issue_number" --repo "$nwo" --remove-label "$label" >/dev/null 2>&1 \
+    || warn "Unable to remove label '$label' from issue #$issue_number"
 }
 
 add_issue_label_hard() {
   local repo_main="$1"
   local issue_number="$2"
   local label="$3"
-  (
-    cd "$repo_main"
-    gh issue edit "$issue_number" --add-label "$label" >/dev/null
-  ) || die "Failed adding label '$label' on issue #$issue_number"
+  local nwo
+  nwo="$(gh_repo_nwo "$repo_main")"
+  gh issue edit "$issue_number" --repo "$nwo" --add-label "$label" >/dev/null \
+    || die "Failed adding label '$label' on issue #$issue_number"
 }
 
 set_issue_state_label() {
@@ -237,10 +271,10 @@ comment_issue() {
   local repo_main="$1"
   local issue_number="$2"
   local body="$3"
-  (
-    cd "$repo_main"
-    gh issue comment "$issue_number" --body "$body" >/dev/null
-  ) || warn "Failed posting comment on issue #$issue_number"
+  local nwo
+  nwo="$(gh_repo_nwo "$repo_main")"
+  gh issue comment "$issue_number" --repo "$nwo" --body "$body" >/dev/null \
+    || warn "Failed posting comment on issue #$issue_number"
 }
 
 # Resolve GitHub owner/repo (nameWithOwner) from local repo path.
@@ -248,7 +282,8 @@ gh_repo_nwo() {
   local repo_main="$1"
   (
     cd "$repo_main"
-    gh repo view --json nameWithOwner -q '.nameWithOwner'
+    git remote get-url origin \
+      | sed -E 's|.*github\.com[:/](.+)\.git$|\1|; s|.*github\.com[:/](.+)$|\1|'
   ) || die "Failed to resolve GitHub repo name from: $repo_main"
 }
 
@@ -1819,10 +1854,9 @@ status_for_spec() {
 
   local labels_json='[]'
   if [ -n "$issue_number" ]; then
-    labels_json="$(
-      cd "$repo_main"
-      gh issue view "$issue_number" --json labels 2>/dev/null | jq -c '.labels // []'
-    )" || true
+    local _nwo
+    _nwo="$(gh_repo_nwo "$repo_main")"
+    labels_json="$(gh issue view "$issue_number" --repo "$_nwo" --json labels 2>/dev/null | jq -c '.labels // []')" || true
   fi
 
   # Return the actual lifecycle label if present.
@@ -1859,11 +1893,10 @@ clarification_for_issue() {
 
   [ -n "$issue_number" ] || { printf -- '--'; return 0; }
 
-  local labels_json
-  labels_json="$(
-    cd "$repo_main"
-    gh issue view "$issue_number" --json labels 2>/dev/null | jq -c '.labels // []'
-  )" || { printf -- '--'; return 0; }
+  local labels_json _nwo2
+  _nwo2="$(gh_repo_nwo "$repo_main")"
+  labels_json="$(gh issue view "$issue_number" --repo "$_nwo2" --json labels 2>/dev/null | jq -c '.labels // []')" \
+    || { printf -- '--'; return 0; }
 
   if printf '%s' "$labels_json" | jq -e '.[] | select(.name == "human-clarified")' >/dev/null 2>&1; then
     printf 'clarified'
@@ -2141,6 +2174,8 @@ cmd_create() {
     echo "Auto-trigger: disabled (--no-auto)"
     echo "Manual trigger: say \"let's draft this\" in the planning session"
   fi
+
+  notify_telegram "acorn: spec pipeline started for #${issue_number} (${slug}) [${mode}]"
 }
 
 cmd_list() {
@@ -2204,6 +2239,8 @@ cmd_approve() {
   comment_issue "$repo_main" "$issue_number" "Spec approved for implementation: $dir/plans/SPEC.md"
 
   echo "Approved $slug (issue #$issue_number)"
+
+  notify_telegram "acorn: spec approved, ready for Pi dispatch -- #${issue_number} (${slug})"
 }
 
 cmd_spec_complete() {
@@ -2228,6 +2265,8 @@ cmd_spec_complete() {
   comment_issue "$repo_main" "$issue_number" "Spec ready for review: $dir/plans/SPEC.md"
 
   echo "Marked $slug (issue #$issue_number) as spec-review"
+
+  notify_telegram "acorn: spec ready for review -- #${issue_number} (${slug})"
 }
 
 cmd_clean() {
@@ -2282,7 +2321,7 @@ cmd_clean() {
     issue_number="$(issue_number_from_slug "$slug")"
     local issue_state="unknown"
     if [ -n "$issue_number" ]; then
-      issue_state="$(cd "$repo_main" && gh issue view "$issue_number" --json state -q '.state' 2>/dev/null || printf 'unknown')"
+      issue_state="$(gh issue view "$issue_number" --repo "$(gh_repo_nwo "$repo_main")" --json state -q '.state' 2>/dev/null || printf 'unknown')"
     fi
     if [ "$issue_state" != "CLOSED" ]; then
       warn "Spec has plans/SPEC.md but issue #${issue_number:-?} is still open (state: $issue_state)."
@@ -2314,6 +2353,8 @@ cmd_clean() {
 
   rm -rf "$target"
   info "Removed $target"
+
+  notify_telegram "acorn: spec/session removed -- ${slug}"
 
   if [ "$remove_labels" -eq 1 ]; then
     require_cmds gh
@@ -2719,11 +2760,9 @@ cmd_issue_clarify() {
   ensure_labels "$repo_main"
 
   # Transition lifecycle only when still at triage (or unset).
-  local labels_json current_lifecycle="" label
-  labels_json="$(
-    cd "$repo_main"
-    gh issue view "$issue_number" --json labels 2>/dev/null | jq -c '.labels // []'
-  )" || labels_json='[]'
+  local labels_json current_lifecycle="" label _nwo3
+  _nwo3="$(gh_repo_nwo "$repo_main")"
+  labels_json="$(gh issue view "$issue_number" --repo "$_nwo3" --json labels 2>/dev/null | jq -c '.labels // []')" || labels_json='[]'
 
   for label in "${LIFECYCLE_LABELS[@]}"; do
     if printf '%s' "$labels_json" | jq -e --arg l "$label" '.[] | select(.name == $l)' >/dev/null 2>&1; then
@@ -3101,6 +3140,103 @@ cmd_issue_plan() {
   cmd_create "$repo" "$issue_num" "${create_flags[@]+"${create_flags[@]}"}"
 }
 
+cmd_doctor() {
+  local repo="${1:-}"
+  require_cmds python3 jq
+
+  local hang_check_script="${FOREMAN_HOME:-$HOME/.foreman}/bin/hang-detect.sh"
+  local use_external=1
+  if [ ! -x "$hang_check_script" ]; then
+    warn "hang-detect.sh not found at $hang_check_script -- using inline mtime check"
+    use_external=0
+  fi
+
+  local found=0 hung=0
+
+  printf '%-16s %-42s %-12s %-8s %-10s %s\n' \
+    "REPO" "SLUG" "SESSION" "STATUS" "AGE" "HEALTH"
+  printf '%-16s %-42s %-12s %-8s %-10s %s\n' \
+    "----" "----" "-------" "------" "---" "------"
+
+  local repos_to_check=()
+  local r sr slug_dir slug meta
+  if [ -n "$repo" ]; then
+    repos_to_check=("$repo")
+  else
+    local spec_base
+    for spec_base in "$PROJECTS_DIR"/*/main/.specs; do
+      [ -d "$spec_base" ] || continue
+      r="$(basename "$(dirname "$(dirname "$spec_base")")")"
+      repos_to_check+=("$r")
+    done
+  fi
+
+  for r in "${repos_to_check[@]}"; do
+    sr="$(spec_root "$r")"
+    [ -d "$sr" ] || continue
+
+    for slug_dir in "$sr"/*/; do
+      [ -d "$slug_dir" ] || continue
+      slug="$(basename "$slug_dir")"
+      meta="$slug_dir/meta.json"
+      [ -f "$meta" ] || continue
+
+      local session_name
+      session_name="$(jq -r '.session_name // empty' "$meta" 2>/dev/null)"
+      [ -n "$session_name" ] || continue
+
+      local state
+      state="$(session_state "$session_name" 1)"
+      [ "$state" = "running" ] || continue
+
+      found=$((found + 1))
+
+      local health="active" age="?"
+      if [ "$use_external" -eq 1 ]; then
+        local result
+        result=$(bash "$hang_check_script" acorn "$session_name" "${slug_dir%/}" 2>/dev/null) || true
+        if [ -n "$result" ]; then
+          health=$(printf '%s' "$result" | jq -r '.status // "unknown"')
+          age="$(printf '%s' "$result" | jq -r '.age_minutes // "?"')m"
+        fi
+      else
+        # Inline fallback: check newest file mtime
+        local newest_mtime now_epoch age_min
+        newest_mtime=$(find "$slug_dir" -maxdepth 4 -type f -printf '%T@\n' 2>/dev/null \
+          | sort -rn | head -1 | cut -d. -f1)
+        newest_mtime="${newest_mtime:-0}"
+        now_epoch=$(date +%s)
+        if [ "$newest_mtime" -gt 0 ]; then
+          age_min=$(( (now_epoch - newest_mtime) / 60 ))
+        else
+          age_min=$(( (now_epoch - $(stat -c '%Y' "$slug_dir" 2>/dev/null || echo "$now_epoch")) / 60 ))
+        fi
+        age="${age_min}m"
+        if [ "$age_min" -ge 30 ]; then health="stalled"; else health="active"; fi
+      fi
+
+      [ "$health" = "stalled" ] && hung=$((hung + 1))
+
+      printf '%-16s %-42s %-12s %-8s %-10s %s\n' \
+        "$r" "$slug" "running" "acorn" "$age" "$health"
+    done
+  done
+
+  if [ "$found" -eq 0 ]; then
+    printf '\nNo active Acorn sessions found.\n'
+    exit 1
+  fi
+
+  if [ "$hung" -gt 0 ]; then
+    printf '\n%d of %d session(s) appear hung.\n' "$hung" "$found"
+    notify_telegram "acorn doctor: $hung of $found session(s) appear hung" 2>/dev/null || true
+    exit 0
+  else
+    printf '\nAll %d session(s) healthy.\n' "$found"
+    exit 1
+  fi
+}
+
 main() {
   local cmd="${1:-}"
   local subcmd
@@ -3133,6 +3269,10 @@ main() {
     spec-complete)
       [ "$#" -eq 3 ] || { usage; exit 1; }
       cmd_spec_complete "$2" "$3"
+      ;;
+    doctor)
+      shift 1
+      cmd_doctor "$@"
       ;;
     clean)
       [ "$#" -ge 3 ] || { usage; exit 1; }
