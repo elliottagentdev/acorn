@@ -3,7 +3,7 @@ set -euo pipefail
 IFS=$'\n\t'
 
 SCRIPT_NAME="acorn"
-PROJECTS_DIR="/mnt/e/agentdev/projects"
+PROJECTS_DIR="${PROJECTS_DIR:-/mnt/e/agentdev/projects}"
 LIFECYCLE_LABELS=("triage" "ready-for-spec" "spec-in-progress" "spec-review" "spec-approved" "implementing" "in-review" "review-pass" "review-blocked" "review-skipped" "done")
 CLARIFICATION_LABELS=("ai-drafted" "human-clarified")
 TELEGRAM_NOTIFY_PORT="${TELEGRAM_NOTIFY_PORT:-8765}"

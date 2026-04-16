@@ -46,9 +46,9 @@ export PATH="$TMPDIR_BASE/bin:$PATH"
 # without executing main. Strip the trailing `main "$@"` invocation.
 eval "$(sed '/^main "\$@"$/d' "$ACORN_SCRIPT")"
 
-# Override hardcoded script-level PROJECTS_DIR to point at our sandbox.
-# (The `acorn` script assigns PROJECTS_DIR unconditionally at the top, so
-# exporting it before sourcing has no effect — we override after sourcing.)
+# Override PROJECTS_DIR to point at our sandbox.
+# (The export on line 23 now takes effect via ${PROJECTS_DIR:-...} default syntax,
+# but this explicit override is kept for clarity.)
 PROJECTS_DIR="$TMPDIR_BASE/projects"
 
 # Override notify_telegram to capture calls in-process
