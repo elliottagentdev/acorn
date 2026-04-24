@@ -50,6 +50,107 @@ notify_telegram() {
   disown
 }
 
+# Post structured event to Forged /notify-foreman endpoint.
+# Falls back to Telegram (port 8765) on failure.
+# Fire-and-forget: never block acorn on notification failure.
+notify_foreman() {
+  local event_type="$1"
+  local message="$2"
+  local session="${3:-}"
+  local extra_data="${4:-{}}"
+
+  (
+    if ! command -v curl >/dev/null 2>&1; then
+      return 0
+    fi
+
+    if ! command -v jq >/dev/null 2>&1; then
+      local tg_payload
+      tg_payload="{\"message\": \"$message\"}"
+      curl -fsS --max-time 5 \
+        -H "Content-Type: application/json" \
+        -d "$tg_payload" \
+        "$TELEGRAM_NOTIFY_URL" >/dev/null 2>&1 || true
+      return 0
+    fi
+
+    if ! jq -e . >/dev/null 2>&1 <<<"$extra_data"; then
+      extra_data='{}'
+    fi
+
+    local payload
+    payload="$(jq -nc \
+      --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      --arg event "$event_type" \
+      --arg session "$session" \
+      --argjson data "$extra_data" \
+      '{ts: $ts, event: $event, source: "acorn", session: $session, data: $data}')"
+
+    local http_code
+    http_code=$(curl -s --max-time 3 \
+      -o /dev/null -w '%{http_code}' \
+      -X POST -H "Content-Type: application/json" \
+      -d "$payload" \
+      "http://localhost:7700/notify-foreman" 2>/dev/null) || http_code="0"
+
+    if [[ "$http_code" != "200" ]]; then
+      local tg_payload
+      if [ -n "$session" ]; then
+        tg_payload="$(jq -nc --arg m "$message" --arg s "$session" '{message: $m, session: $s}')"
+      else
+        tg_payload="$(jq -nc --arg m "$message" '{message: $m}')"
+      fi
+      curl -fsS --max-time 5 \
+        -H "Content-Type: application/json" \
+        -d "$tg_payload" \
+        "$TELEGRAM_NOTIFY_URL" >/dev/null 2>&1 || true
+    fi
+  ) &
+  disown
+}
+
+check_circuit_breaker() {
+  local forged_url="http://localhost:7700/status"
+  local response
+  set +e
+  response="$(curl -fsS --max-time 3 "$forged_url" 2>/dev/null)"
+  local ec=$?
+  set -e
+
+  if [ $ec -ne 0 ]; then
+    warn "Forged not reachable -- skipping circuit breaker check (fail-open)"
+    return 0
+  fi
+
+  local blocked
+  blocked="$(printf '%s' "$response" | jq -r '.acorn_circuit_breaker.blocked // false' 2>/dev/null)"
+  if [ "$blocked" = "true" ]; then
+    die "Acorn circuit breaker is TRIPPED (systemic idle failures). Reset via: curl -X POST localhost:7700/reset-acorn-circuit-breaker"
+  fi
+  return 0
+}
+
+register_with_forged() {
+  local session_name="$1"
+  local mode="$2"
+  local spec_dir="$3"
+  local payload
+  payload="$(jq -nc \
+    --arg session "$session_name" \
+    --arg type "acorn" \
+    --arg mode "$mode" \
+    --arg spec_dir "$spec_dir" \
+    '{session: $session, type: $type, meta: {mode: $mode, spec_dir: $spec_dir}}')"
+  (
+    curl -fsS --max-time 3 \
+      -H "Content-Type: application/json" \
+      -d "$payload" \
+      "http://localhost:7700/register" >/dev/null 2>&1 \
+      || true
+  ) &
+  disown
+}
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -60,6 +161,8 @@ Usage:
   acorn spec-complete <repo> <slug>
   acorn clean <repo> <slug> [--remove-labels] [--yes] [--force]
   acorn doctor [repo]
+  acorn setup-watchdog [--bootstrap]
+  acorn watchdog-reset [scope]     Clear stale watchdog markers (scope: all|completed|dead|stall|idle|launch|bootstrap)
   acorn issue create <repo> <title> [--body <text> | --body-file <path> | --raw] [--label <name>]... [--assignee <login>]... [--blocked-by <issue#>[,<issue#>...]]
   acorn issue plan <repo> <title> [options] [--blocked-by <issue#>[,<issue#>...]] [--no-auto] [--lite | --quick]
   acorn issue clarify <repo> <issue-number>
@@ -991,6 +1094,17 @@ Produce the FINAL, COMPLETE implementation specification. It MUST include:
 
 5. **Risk Register**: Unresolved risks with severity, likelihood, and mitigation strategies.
 
+6. **Pi Model Recommendation**: Based on the full context of this spec, emit a `## Pi Model Recommendation`
+   section at the top of SPEC.md (before ## 1. Requirements Traceability Matrix) containing exactly two lines:
+
+   suggested_pi_model: codex
+   suggested_pi_model_rationale: <one-line explanation>
+
+   Use value `codex` when: spec names specific files and functions, implementation is pattern-following,
+   touches < 8 files, introduces no new interfaces or schemas, includes explicit test commands.
+   Use value `opus` when: requirements are vague or exploratory, introduces new architectural patterns,
+   crosses subsystem boundaries, adds new interfaces or schemas, touches > 8 files with design judgment required.
+
 The spec must be ready to be handed to a developer or agent for implementation with ZERO questions.
 
 - Write the final spec to __SPEC_PATH__/plans/SPEC.md
@@ -1258,6 +1372,17 @@ Produce the FINAL, COMPLETE implementation specification. It MUST include:
 
 5. **Risk Register**: Unresolved risks with severity, likelihood, and mitigation strategies.
 
+6. **Pi Model Recommendation**: Based on the full context of this spec, emit a `## Pi Model Recommendation`
+   section at the top of SPEC.md (before ## 1. Requirements Traceability Matrix) containing exactly two lines:
+
+   suggested_pi_model: codex
+   suggested_pi_model_rationale: <one-line explanation>
+
+   Use value `codex` when: spec names specific files and functions, implementation is pattern-following,
+   touches < 8 files, introduces no new interfaces or schemas, includes explicit test commands.
+   Use value `opus` when: requirements are vague or exploratory, introduces new architectural patterns,
+   crosses subsystem boundaries, adds new interfaces or schemas, touches > 8 files with design judgment required.
+
 The spec must be ready to be handed to a developer or agent for implementation with ZERO questions.
 
 - Write the final spec to __SPEC_PATH__/plans/SPEC.md
@@ -1436,6 +1561,17 @@ The spec MUST include:
 
 4. **Risk Register**: Known risks with severity, likelihood, and mitigation strategies.
 
+5. **Pi Model Recommendation**: Based on the full context of this spec, emit a `## Pi Model Recommendation`
+   section at the top of SPEC.md (before ## 1. Requirements Traceability Matrix) containing exactly two lines:
+
+   suggested_pi_model: codex
+   suggested_pi_model_rationale: <one-line explanation>
+
+   Use value `codex` when: spec names specific files and functions, implementation is pattern-following,
+   touches < 8 files, introduces no new interfaces or schemas, includes explicit test commands.
+   Use value `opus` when: requirements are vague or exploratory, introduces new architectural patterns,
+   crosses subsystem boundaries, adds new interfaces or schemas, touches > 8 files with design judgment required.
+
 The spec must be ready to be handed to a developer or agent for implementation with ZERO questions.
 Be specific — reference actual file paths, function names, and code patterns from the recon documents.
 
@@ -1512,10 +1648,15 @@ render_prompt_md() {
 
 When implementation is complete, the implementing agent must:
 
-1. Create or update `DONE.md` in the spec directory.
+1. Create or update `DONE.md` in the spec directory (`.specs/<slug>/DONE.md`).
+   **IMPORTANT**: Always write to the spec directory, NOT the worktree root.
+   For non-repo work (scripts, config, behavioral specs), the spec directory
+   is at `<project_root>/<repo>/main/.specs/<slug>/DONE.md`.
 2. Include the exact test commands run and their outcomes.
-3. Summarize file changes and rationale in concise bullet points.
-4. List any follow-up risks or deferred work.
+3. For non-repo work, include a `## Work Type` section listing the category
+   and primary artifact paths.
+4. Summarize file changes and rationale in concise bullet points.
+5. List any follow-up risks or deferred work.
 EOF
   } > "$out_tmp"
 }
@@ -1692,47 +1833,32 @@ start_session() {
   printf '%s\n%s' "tmux" "$session_name"
 }
 
-# Wait for Claude Code to show its input prompt in a tmux session.
-# Polls tmux pane content at regular intervals up to a maximum wait time.
-# Returns 0 when the prompt is detected, 1 on timeout.
-# On timeout the caller should proceed anyway (graceful degradation).
-wait_for_claude_ready() {
-  local session_name="$1"
-  local max_wait="${2:-30}"
-  local interval="${3:-2}"
-  local elapsed=0
+# Write a CLAUDE.md file to the spec directory so Claude Code reads it on startup.
+# This replaces the old send_auto_trigger() polling mechanism.
+# The file is written atomically (write to .tmp, then mv) to prevent partial reads.
+# Dies on failure -- trigger must be loud, never silent.
+write_spec_claude_md() {
+  local spec_path="$1"
+  local mode="${2:-full}"
+  local claude_md="$spec_path/CLAUDE.md"
+  local tmp_file="$spec_path/.CLAUDE.md.tmp"
+  local trigger_msg
+  trigger_msg="$(auto_trigger_message "$spec_path" "$mode")"
 
-  while [ "$elapsed" -lt "$max_wait" ]; do
-    local pane_content
-    pane_content="$(tmux capture-pane -t "$session_name" -ep 2>/dev/null || true)"
-    # Strip any residual ANSI escape codes
-    pane_content="$(printf '%s' "$pane_content" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g')"
-    # Check the last few lines for Claude Code's prompt
-    if printf '%s' "$pane_content" | tail -n5 | grep -qE '>\s*$'; then
-      return 0
-    fi
-    sleep "$interval"
-    elapsed=$((elapsed + interval))
-  done
+  { cat > "$tmp_file" <<EOF
+# Acorn Spec Session -- Auto-trigger
 
-  return 1
-}
+## MANDATORY: Execute on Session Start
 
-# Send auto-trigger message to a claude session once it is ready.
-# Waits for Claude Code to show its input prompt, then sends the message.
-# Falls back to sending after timeout if prompt is not detected.
-send_auto_trigger() {
-  local session_name="$1"
-  local message="$2"
-  (
-    # Wait for Claude Code to be ready (up to 30s); proceed on timeout (|| true
-    # prevents set -e from killing the subshell when wait_for_claude_ready returns 1)
-    wait_for_claude_ready "$session_name" 30 2 || true
-    tmux send-keys -t "$session_name" -l "$message"
-    sleep 1
-    tmux send-keys -t "$session_name" Enter
-  ) &
-  disown
+$trigger_msg
+EOF
+  } 2>/dev/null || die "Failed to write CLAUDE.md to $spec_path -- cannot create trigger file"
+
+  mv "$tmp_file" "$claude_md" 2>/dev/null \
+    || die "Failed to write CLAUDE.md to $spec_path -- atomic rename failed"
+
+  [ -f "$claude_md" ] \
+    || die "CLAUDE.md missing after write at $claude_md -- filesystem error"
 }
 
 kill_session() {
@@ -2085,6 +2211,46 @@ cmd_create() {
   done
 
   require_cmds gh jq tmux claude
+
+  # --- Auth pre-flight gate (W4.5-0b) ---
+  local FOREMAN_BIN="${FOREMAN_HOME:-$HOME/.foreman}/bin"
+  if [ -x "$FOREMAN_BIN/auth-check.sh" ]; then
+    set +e
+    local auth_json
+    auth_json=$(bash "$FOREMAN_BIN/auth-check.sh" "claude-code" 2>/dev/null)
+    local auth_rc=$?
+    set -e
+
+    if [ "$auth_rc" -eq 1 ]; then
+      warn "Auth expired for claude-code — pipeline launch blocked"
+      local err_data
+      err_data="$(jq -nc \
+        --arg repo "$repo" \
+        --arg slug "" \
+        --argjson issue "$issue_number" \
+        --arg reason "auth_expired" \
+        '{repo: $repo, slug: $slug, issue: $issue, reason: $reason}')"
+      notify_foreman \
+        "acorn_error" \
+        "acorn: auth expired for claude-code -- pipeline aborted for #${issue_number}" \
+        "forge_specs_${issue_number}_claude" \
+        "$err_data"
+      die "Auth expired for claude-code — re-authenticate before running acorn create"
+    fi
+
+    if [ "$auth_rc" -eq 2 ]; then
+      warn "Auth expiring soon for claude-code — proceeding anyway"
+    fi
+
+    if [ "$auth_rc" -eq 3 ]; then
+      warn "auth-check.sh failed (exit 3) — skipping auth gate"
+    fi
+  else
+    info "auth-check.sh not found — skipping auth pre-flight check"
+  fi
+
+  check_circuit_breaker
+
   local repo_main
   repo_main="$(safe_repo_main "$repo")"
 
@@ -2146,16 +2312,34 @@ cmd_create() {
   fi
 
   if [ "$alive" -eq 0 ]; then
+    # Write CLAUDE.md BEFORE session start. Claude Code reads CLAUDE.md from CWD on startup.
+    # If the file does not exist when Claude starts, the session idles (F1).
+    if [ "$auto_trigger" -eq 1 ]; then
+      [ -s "$dir/PROMPT.md" ] || die "PROMPT.md missing or empty at $dir -- cannot write CLAUDE.md"
+      if [ -d "$dir/recon" ] && [ -n "$(find "$dir/recon" -name '*.md' -type f 2>/dev/null | head -1)" ]; then
+        warn "Recon output already exists in $dir/recon -- session restart. Existing output preserved."
+      fi
+      write_spec_claude_md "$dir" "$mode"
+      info "Auto-trigger: CLAUDE.md written to spec dir (before session start)"
+    else
+      rm -f "$dir/CLAUDE.md"
+    fi
+
     local session_result
     session_result="$(start_session "$repo" "$slug" "$dir" "$auto_trigger")"
     session_name="$(printf '%s' "$session_result" | tail -n1)"
+    [ -n "$session_name" ] || die "start_session returned empty session name for $slug"
     started_new_session=1
 
+    # Record launch time for external watchdog to verify recon starts within 2 minutes.
     if [ "$auto_trigger" -eq 1 ]; then
-      send_auto_trigger "$session_name" "$(auto_trigger_message "$dir" "$mode")"
-      info "Auto-trigger queued (waiting for readiness, up to ~30s)"
+      local watchdog_state="$HOME/.foreman/watchdog-state"
+      mkdir -p "$watchdog_state"
+      date -Iseconds > "$watchdog_state/launch_${session_name}"
     fi
   fi
+
+  register_with_forged "$session_name" "$mode" "$dir"
 
   write_meta_json "$meta_path" "$repo" "$issue_number" "$title" "$slug" "tmux" "$session_name" "$mode"
 
@@ -2166,7 +2350,7 @@ cmd_create() {
   echo "Attach: tmux attach -t $session_name"
   if [ "$auto_trigger" -eq 1 ]; then
     if [ "$started_new_session" -eq 1 ]; then
-      echo "Auto-trigger: waiting for Claude Code to be ready (up to ~30s)"
+      echo "Auto-trigger: CLAUDE.md written to spec dir"
     else
       echo "Auto-trigger: skipped (session already running)"
     fi
@@ -2241,6 +2425,23 @@ cmd_approve() {
   echo "Approved $slug (issue #$issue_number)"
 
   notify_telegram "acorn: spec approved, ready for Pi dispatch -- #${issue_number} (${slug})"
+
+  # W3-4: Extract spec metadata and write to metadata.json for Foreman enrichment
+  local foreman_home="${FOREMAN_HOME:-$HOME/.foreman}"
+  local extract_script="${foreman_home}/bin/spec-metadata-extract.sh"
+  if [ -x "$extract_script" ]; then
+    local meta_json
+    meta_json="$(bash "$extract_script" "$dir" 2>/dev/null)" || meta_json=""
+    if [ -n "$meta_json" ]; then
+      local tmp_meta="${dir}/metadata.json.tmp.$$"
+      printf '%s\n' "$meta_json" > "$tmp_meta"
+      mv -f "$tmp_meta" "${dir}/metadata.json"
+    else
+      local tmp_meta="${dir}/metadata.json.tmp.$$"
+      printf 'null\n' > "$tmp_meta"
+      mv -f "$tmp_meta" "${dir}/metadata.json"
+    fi
+  fi
 }
 
 cmd_spec_complete() {
@@ -2266,7 +2467,18 @@ cmd_spec_complete() {
 
   echo "Marked $slug (issue #$issue_number) as spec-review"
 
-  notify_telegram "acorn: spec ready for review -- #${issue_number} (${slug})"
+  local spec_data
+  spec_data="$(jq -nc \
+    --arg repo "$repo" \
+    --arg slug "$slug" \
+    --argjson issue "$issue_number" \
+    '{repo: $repo, slug: $slug, issue: $issue}')"
+
+  notify_foreman \
+    "acorn.spec_ready" \
+    "acorn: spec ready for review -- #${issue_number} (${slug})" \
+    "${SESSION_NAME:-forge_specs_${slug}_claude}" \
+    "$spec_data"
 }
 
 cmd_clean() {
@@ -3140,9 +3352,92 @@ cmd_issue_plan() {
   cmd_create "$repo" "$issue_num" "${create_flags[@]+"${create_flags[@]}"}"
 }
 
+cmd_setup_watchdog() {
+  local watchdog_script="$HOME/.foreman/bin/completion-watchdog.sh"
+  local log_dir="$HOME/.foreman/logs"
+  local state_dir="$HOME/.foreman/watchdog-state"
+  local user_path="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+  if [ ! -f "$watchdog_script" ]; then
+    die "Watchdog script not found at $watchdog_script -- deploy it first"
+  fi
+
+  chmod +x "$watchdog_script"
+  mkdir -p "$log_dir" "$state_dir"
+
+  # Bootstrap: pre-populate markers for already-completed work to avoid stale notifications
+  if [ "${1:-}" = "--bootstrap" ] || ! [ -f "$state_dir/.bootstrapped" ]; then
+    info "Bootstrapping: scanning for existing completions..."
+    "$watchdog_script" --bootstrap
+    date -Iseconds > "$state_dir/.bootstrapped"
+    info "Bootstrap complete -- existing completions will not trigger notifications"
+  fi
+
+  if command -v crontab >/dev/null 2>&1; then
+    local cron_line="* * * * * PATH=$user_path HOME=$HOME $watchdog_script >> $log_dir/watchdog.log 2>&1"
+
+    if crontab -l 2>/dev/null | grep -qF "completion-watchdog.sh"; then
+      info "Watchdog cron already installed"
+    else
+      (crontab -l 2>/dev/null || true; printf '%s\n' "$cron_line") | crontab -
+      info "Installed watchdog cron: runs every 60 seconds"
+    fi
+  else
+    warn "crontab not available -- using tmux fallback"
+    local interval="${WATCHDOG_INTERVAL_SECONDS:-60}"
+    if tmux has-session -t forge_watchdog 2>/dev/null; then
+      info "Watchdog tmux session already running"
+    else
+      tmux new-session -d -s forge_watchdog \
+        "while true; do PATH=$user_path $watchdog_script >> $log_dir/watchdog.log 2>&1; sleep $interval; done"
+      info "Watchdog running in tmux session: forge_watchdog (interval: ${interval}s)"
+    fi
+  fi
+
+  # --- Verify notification delivery path (R2) ---
+  info "Testing notification delivery..."
+  local verify_port="${TELEGRAM_NOTIFY_PORT:-8765}"
+  local verify_url="http://127.0.0.1:${verify_port}/notify"
+  local verify_msg="[watchdog-setup] Delivery test at $(date -Iseconds)"
+  local verify_payload
+  verify_payload="$(jq -nc --arg m "$verify_msg" '{message: $m}')"
+
+  if curl -fsS --max-time 10 \
+      -H "Content-Type: application/json" \
+      -d "$verify_payload" \
+      "$verify_url" >/dev/null 2>&1; then
+    info "PASS: Test notification delivered -- check Telegram for: $verify_msg"
+  else
+    warn "FAIL: Could not deliver test notification"
+    warn "  Bridge may not be running on port $verify_port"
+    warn "  Cron is installed, but notifications will fail until bridge is running"
+    warn "  Fix: Start the Telegram bridge, then re-run: acorn setup-watchdog"
+    exit 1
+  fi
+
+  info "Logs: $log_dir/watchdog.log"
+  info "Events: $log_dir/watchdog-events.jsonl"
+  info "State: $state_dir/"
+}
+
 cmd_doctor() {
   local repo="${1:-}"
   require_cmds python3 jq
+  local DOCTOR_FAIL=0
+
+  # Check: write_spec_claude_md can write atomically to a temp directory (W3-7)
+  local _tmp_trigger_dir
+  _tmp_trigger_dir="$(mktemp -d 2>/dev/null)" \
+    || { warn "SKIP: auto-trigger write check -- mktemp failed"; }
+  if [ -n "${_tmp_trigger_dir:-}" ]; then
+    if write_spec_claude_md "$_tmp_trigger_dir" "lite" 2>/dev/null \
+        && [ -f "$_tmp_trigger_dir/CLAUDE.md" ]; then
+      info "PASS: auto-trigger write check (CLAUDE.md)"
+    else
+      warn "FAIL: auto-trigger write check -- write_spec_claude_md failed"
+    fi
+    rm -rf "$_tmp_trigger_dir"
+  fi
 
   local hang_check_script="${FOREMAN_HOME:-$HOME/.foreman}/bin/hang-detect.sh"
   local use_external=1
@@ -3222,6 +3517,54 @@ cmd_doctor() {
     done
   done
 
+  # Watchdog cron check
+  if crontab -l 2>/dev/null | grep -qF "completion-watchdog.sh"; then
+    info "PASS: Watchdog cron installed"
+  else
+    if tmux has-session -t forge_watchdog 2>/dev/null; then
+      info "PASS: Watchdog running in tmux fallback"
+    else
+      warn "Watchdog not running -- run: acorn setup-watchdog"
+    fi
+  fi
+
+  # Watchdog health check
+  local events_log="$HOME/.foreman/logs/watchdog-events.jsonl"
+  if [ -f "$events_log" ]; then
+    local log_age
+    log_age="$(( ($(date +%s) - $(stat -c%Y "$events_log" 2>/dev/null || echo 0)) / 60 ))"
+    if [ "$log_age" -gt 5 ]; then
+      warn "Watchdog last active ${log_age}m ago -- may be dead"
+    else
+      info "PASS: Watchdog healthy (last active ${log_age}m ago)"
+    fi
+  else
+    warn "Watchdog events log not found -- watchdog may not have run yet"
+  fi
+
+  # --- Notification endpoint reachability (R1: hard FAIL) ---
+  local notify_port="${TELEGRAM_NOTIFY_PORT:-8765}"
+  local notify_url="http://127.0.0.1:${notify_port}/notify"
+  local probe_http_code
+  probe_http_code="$(curl -sS --max-time 3 -o /dev/null -w '%{http_code}' \
+      -X POST -H "Content-Type: application/json" \
+      -d '{"message":""}' \
+      "$notify_url" 2>/dev/null)" || probe_http_code="000"
+
+  if [ "$probe_http_code" != "000" ]; then
+    info "PASS: Notification endpoint reachable on port $notify_port (HTTP $probe_http_code)"
+  else
+    warn "FAIL: Notification endpoint unreachable on port $notify_port"
+    warn "  The Telegram bridge is not running or port $notify_port is not listening."
+    warn "  Fix: Ensure bridge.py is running (check tmux session 'telegram_bridge')"
+    DOCTOR_FAIL=1
+  fi
+
+  if [ "$DOCTOR_FAIL" -ne 0 ]; then
+    warn "Doctor found critical failures -- notification delivery is broken"
+    exit 1
+  fi
+
   if [ "$found" -eq 0 ]; then
     printf '\nNo active Acorn sessions found.\n'
     exit 1
@@ -3273,6 +3616,14 @@ main() {
     doctor)
       shift 1
       cmd_doctor "$@"
+      ;;
+    setup-watchdog)
+      shift 1
+      cmd_setup_watchdog "$@"
+      ;;
+    watchdog-reset)
+      shift 1
+      "$HOME/.foreman/bin/completion-watchdog.sh" --reset "${1:-all}"
       ;;
     clean)
       [ "$#" -ge 3 ] || { usage; exit 1; }

@@ -553,6 +553,246 @@ print('OK' if not notified else 'ALERTED')
 assert_eq "T22: < 5 trials → no alert" "$RESULT" "OK"
 
 # ---------------------------------------------------------------------------
+# T23: prompt_retry_at set even when injection fails
+# ---------------------------------------------------------------------------
+echo "--- T23: prompt_retry_at set on retry failure ---"
+RESULT=$(python3 -c "
+import sys, os, time, tempfile, json, subprocess
+sys.path.insert(0, '$TMPDIR_BASE')
+sys.path.insert(0, os.environ['FORGED_DIR'])
+import forged
+from helper import make_daemon
+tmp = tempfile.mkdtemp()
+d = make_daemon(tmp)
+name = 'forge_specs_123_claude'
+marker = os.path.join(d.foreman_home, 'watchdog-state', f'launch_{name}')
+with open(marker, 'w') as f: f.write('')
+os.utime(marker, (time.time() - 130, time.time() - 130))
+d.state['sessions'][name] = d._default_session(name, stype='acorn')
+d.state['sessions'][name]['tmux_alive'] = True
+d.state['sessions'][name]['meta'] = {'idle_detected_at': forged._now_iso()}
+os.makedirs(os.path.join(d.projects_dir, 'forge', 'main', '.specs', '123', 'recon'), exist_ok=True)
+orig = forged._run_cmd
+forged._run_cmd = lambda *a, **k: (_ for _ in ()).throw(subprocess.TimeoutExpired(cmd='tmux', timeout=5))
+try:
+    d._step_acorn_idle()
+finally:
+    forged._run_cmd = orig
+meta = d.state['sessions'][name].get('meta', {})
+events = []
+evt_path = os.path.join(d.foreman_home, '.foreman-events.jsonl')
+if os.path.isfile(evt_path):
+    with open(evt_path) as f:
+        for line in f:
+            events.append(json.loads(line))
+retry = [e for e in events if e.get('event') == 'acorn_prompt_retry']
+ok = bool(meta.get('prompt_retry_at')) and bool(retry) and retry[-1].get('injection_success') is False
+print('OK' if ok else f'BAD meta={meta} retry={retry}')
+")
+assert_eq "T23: prompt_retry_at + injection_success=false" "$RESULT" "OK"
+
+# ---------------------------------------------------------------------------
+# T24: no re-retry after failed injection
+# ---------------------------------------------------------------------------
+echo "--- T24: no re-retry after failed injection ---"
+RESULT=$(python3 -c "
+import sys, os, time, tempfile
+sys.path.insert(0, '$TMPDIR_BASE')
+sys.path.insert(0, os.environ['FORGED_DIR'])
+import forged
+from helper import make_daemon
+tmp = tempfile.mkdtemp()
+d = make_daemon(tmp)
+name = 'forge_specs_124_claude'
+marker = os.path.join(d.foreman_home, 'watchdog-state', f'launch_{name}')
+with open(marker, 'w') as f: f.write('')
+os.utime(marker, (time.time() - 125, time.time() - 125))
+d.state['sessions'][name] = d._default_session(name, stype='acorn')
+d.state['sessions'][name]['tmux_alive'] = True
+d.state['sessions'][name]['meta'] = {'idle_detected_at': forged._now_iso(), 'prompt_retry_at': forged._now_iso()}
+os.makedirs(os.path.join(d.projects_dir, 'forge', 'main', '.specs', '124', 'recon'), exist_ok=True)
+called = {'n': 0}
+def _retry(*a, **k):
+    called['n'] += 1
+    return False
+d._acorn_prompt_retry = _retry
+d._step_acorn_idle()
+print('OK' if called['n'] == 0 else f'CALLED={called["n"]}')
+")
+assert_eq "T24: retry skipped when prompt_retry_at present" "$RESULT" "OK"
+
+# ---------------------------------------------------------------------------
+# T25: configurable startup grace
+# ---------------------------------------------------------------------------
+echo "--- T25: configurable startup grace ---"
+RESULT=$(python3 -c "
+import sys, os, time, tempfile
+sys.path.insert(0, '$TMPDIR_BASE')
+from helper import make_daemon
+# age=15, grace=10 -> should detect
+A = tempfile.mkdtemp(); d1 = make_daemon(A)
+d1.config.setdefault('acorn_idle', {})['startup_grace_seconds'] = 10
+d1.config['acorn_idle']['check_seconds'] = 10
+n1 = 'forge_specs_125a_claude'
+m1 = os.path.join(d1.foreman_home, 'watchdog-state', f'launch_{n1}')
+with open(m1, 'w') as f: f.write('')
+os.utime(m1, (time.time() - 15, time.time() - 15))
+d1.state['sessions'][n1] = d1._default_session(n1, stype='acorn')
+d1.state['sessions'][n1]['tmux_alive'] = True
+os.makedirs(os.path.join(d1.projects_dir, 'forge', 'main', '.specs', '125a', 'recon'), exist_ok=True)
+d1._step_acorn_idle()
+# age=5, grace=10 -> should skip
+B = tempfile.mkdtemp(); d2 = make_daemon(B)
+d2.config.setdefault('acorn_idle', {})['startup_grace_seconds'] = 10
+d2.config['acorn_idle']['check_seconds'] = 10
+n2 = 'forge_specs_125b_claude'
+m2 = os.path.join(d2.foreman_home, 'watchdog-state', f'launch_{n2}')
+with open(m2, 'w') as f: f.write('')
+os.utime(m2, (time.time() - 5, time.time() - 5))
+d2.state['sessions'][n2] = d2._default_session(n2, stype='acorn')
+d2.state['sessions'][n2]['tmux_alive'] = True
+os.makedirs(os.path.join(d2.projects_dir, 'forge', 'main', '.specs', '125b', 'recon'), exist_ok=True)
+d2._step_acorn_idle()
+ok = bool(d1.state['sessions'][n1].get('meta', {}).get('idle_detected_at')) and not bool(d2.state['sessions'][n2].get('meta', {}).get('idle_detected_at'))
+print('OK' if ok else 'BAD')
+")
+assert_eq "T25: startup_grace_seconds honored" "$RESULT" "OK"
+
+# ---------------------------------------------------------------------------
+# T26: circuit breaker pre-flight wiring exists
+# ---------------------------------------------------------------------------
+echo "--- T26: circuit breaker pre-flight wiring ---"
+ACORN_SRC="$(readlink -f /home/agentdev/acorn/bin/acorn)"
+ACORN_TEXT="$(<"$ACORN_SRC")"
+assert_contains "T26a: check_circuit_breaker defined" "$ACORN_TEXT" "check_circuit_breaker()"
+CMD_CREATE_BLOCK="$(awk '/^cmd_create\(\)/,/^}/' "$ACORN_SRC")"
+if printf '%s' "$CMD_CREATE_BLOCK" | grep -q "check_circuit_breaker"; then
+  pass "T26b: cmd_create calls check_circuit_breaker"
+else
+  fail "T26b: cmd_create calls check_circuit_breaker" "call site missing"
+fi
+
+# ---------------------------------------------------------------------------
+# T27: nudge scheduled when injection fails
+# ---------------------------------------------------------------------------
+echo "--- T27: nudge scheduled on injection failure ---"
+RESULT=$(python3 -c "
+import sys, os, time, tempfile
+sys.path.insert(0, '$TMPDIR_BASE')
+sys.path.insert(0, os.environ['FORGED_DIR'])
+import forged
+from helper import make_daemon
+tmp = tempfile.mkdtemp(); d = make_daemon(tmp)
+name = 'forge_specs_127_claude'
+marker = os.path.join(d.foreman_home, 'watchdog-state', f'launch_{name}')
+with open(marker, 'w') as f: f.write('')
+os.utime(marker, (time.time() - 130, time.time() - 130))
+d.state['sessions'][name] = d._default_session(name, stype='acorn')
+d.state['sessions'][name]['tmux_alive'] = True
+d.state['sessions'][name]['meta'] = {'idle_detected_at': forged._now_iso()}
+os.makedirs(os.path.join(d.projects_dir, 'forge', 'main', '.specs', '127', 'recon'), exist_ok=True)
+seen = {'nudges': [], 'events': []}
+d.api_schedule_nudge = lambda body: seen['nudges'].append(body) or (200, {'ok': True})
+d._emit_foreman_event = lambda et, **kw: seen['events'].append((et, kw))
+d._acorn_prompt_retry = lambda *_: False
+d._step_acorn_idle()
+meta = d.state['sessions'][name].get('meta', {})
+retry_evt = [e for e in seen['events'] if e[0] == 'acorn_prompt_retry']
+ok = bool(meta.get('prompt_retry_at')) and bool(seen['nudges']) and seen['nudges'][0].get('id') == f'acorn_retry_fail_{name}' and 'retry injection failed' in seen['nudges'][0].get('message', '') and bool(retry_evt) and retry_evt[0][1].get('injection_success') is False
+print('OK' if ok else f'BAD {seen} meta={meta}')
+")
+assert_eq "T27: retry failure schedules nudge" "$RESULT" "OK"
+
+# ---------------------------------------------------------------------------
+# T27b: Block B event emitted even when injection fails
+# ---------------------------------------------------------------------------
+echo "--- T27b: event emitted on injection failure ---"
+RESULT=$(python3 -c "
+import sys, os, time, tempfile, subprocess
+sys.path.insert(0, '$TMPDIR_BASE')
+sys.path.insert(0, os.environ['FORGED_DIR'])
+import forged
+from helper import make_daemon
+tmp = tempfile.mkdtemp(); d = make_daemon(tmp)
+name = 'forge_specs_127b_claude'
+marker = os.path.join(d.foreman_home, 'watchdog-state', f'launch_{name}')
+with open(marker, 'w') as f: f.write('')
+os.utime(marker, (time.time() - 130, time.time() - 130))
+d.state['sessions'][name] = d._default_session(name, stype='acorn')
+d.state['sessions'][name]['tmux_alive'] = True
+d.state['sessions'][name]['meta'] = {'idle_detected_at': forged._now_iso()}
+os.makedirs(os.path.join(d.projects_dir, 'forge', 'main', '.specs', '127b', 'recon'), exist_ok=True)
+events = []
+d._emit_foreman_event = lambda et, **kw: events.append((et, kw))
+orig = forged._run_cmd
+forged._run_cmd = lambda *a, **k: (_ for _ in ()).throw(subprocess.TimeoutExpired(cmd='tmux', timeout=5))
+try:
+    d._step_acorn_idle()
+finally:
+    forged._run_cmd = orig
+meta = d.state['sessions'][name].get('meta', {})
+retry = [e for e in events if e[0] == 'acorn_prompt_retry']
+ok = bool(meta.get('prompt_retry_at')) and len(retry) == 1 and retry[0][1].get('injection_success') is False and ('snapshot_captured' in retry[0][1])
+print('OK' if ok else f'BAD meta={meta} events={events}')
+")
+assert_eq "T27b: event emitted with injection_success=false" "$RESULT" "OK"
+
+# ---------------------------------------------------------------------------
+# T28: nudge scheduled for systemic alert
+# ---------------------------------------------------------------------------
+echo "--- T28: nudge scheduled for systemic alert ---"
+RESULT=$(python3 -c "
+import sys, os, tempfile
+sys.path.insert(0, '$TMPDIR_BASE')
+from helper import make_daemon
+tmp = tempfile.mkdtemp(); d = make_daemon(tmp)
+name = 'forge_specs_128-foo_claude'
+seen = {'nudges': [], 'events': []}
+d.api_schedule_nudge = lambda body: seen['nudges'].append(body) or (200, {'ok': True})
+d._emit_foreman_event = lambda et, **kw: seen['events'].append((et, kw))
+d._acorn_idle_alert(name, {'type': 'acorn'}, systemic=True)
+msg_ok = bool(seen['nudges']) and seen['nudges'][0].get('id') == f'acorn_systemic_{name}' and 'systemic idle' in seen['nudges'][0].get('message', '')
+notify_ok = any('SYSTEMIC FAILURE' in n.get('message', '') for n in d._notifications)
+print('OK' if msg_ok and notify_ok else f'BAD {seen} notif={d._notifications}')
+")
+assert_eq "T28: systemic alert schedules nudge" "$RESULT" "OK"
+
+# ---------------------------------------------------------------------------
+# T28b: event still emitted when pane capture + injection fail
+# ---------------------------------------------------------------------------
+echo "--- T28b: event emitted when pane capture+injection fail ---"
+RESULT=$(python3 -c "
+import sys, os, time, tempfile, subprocess
+sys.path.insert(0, '$TMPDIR_BASE')
+sys.path.insert(0, os.environ['FORGED_DIR'])
+import forged
+from helper import make_daemon
+tmp = tempfile.mkdtemp(); d = make_daemon(tmp)
+name = 'forge_specs_128b_claude'
+marker = os.path.join(d.foreman_home, 'watchdog-state', f'launch_{name}')
+with open(marker, 'w') as f: f.write('')
+os.utime(marker, (time.time() - 130, time.time() - 130))
+d.state['sessions'][name] = d._default_session(name, stype='acorn')
+d.state['sessions'][name]['tmux_alive'] = True
+d.state['sessions'][name]['meta'] = {'idle_detected_at': forged._now_iso()}
+os.makedirs(os.path.join(d.projects_dir, 'forge', 'main', '.specs', '128b', 'recon'), exist_ok=True)
+d._capture_pane_text = lambda *_: (_ for _ in ()).throw(OSError('capture fail'))
+events = []
+d._emit_foreman_event = lambda et, **kw: events.append((et, kw))
+orig = forged._run_cmd
+forged._run_cmd = lambda *a, **k: (_ for _ in ()).throw(subprocess.TimeoutExpired(cmd='tmux', timeout=5))
+try:
+    d._step_acorn_idle()
+finally:
+    forged._run_cmd = orig
+meta = d.state['sessions'][name].get('meta', {})
+retry = [e for e in events if e[0] == 'acorn_prompt_retry']
+ok = bool(meta.get('prompt_retry_at')) and meta.get('pane_snapshot_pre_retry', 'x') == '' and len(retry) == 1 and retry[0][1].get('injection_success') is False and retry[0][1].get('snapshot_captured') is False
+print('OK' if ok else f'BAD meta={meta} events={events}')
+")
+assert_eq "T28b: block-B event survives capture+injection failure" "$RESULT" "OK"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
