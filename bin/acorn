@@ -1827,6 +1827,10 @@ start_session() {
   tmux new-session -d -s "$session_name" -c "$spec_path"
   if [ "$auto_trigger" -eq 1 ]; then
     tmux send-keys -t "$session_name" "claude --dangerously-skip-permissions" C-m || true
+    # Claude Code v2 stages the CLAUDE.md trigger as queued input but doesn't auto-submit.
+    # Send a delayed Enter so the staged trigger fires. Backgrounded so start_session returns.
+    ( sleep 5 && tmux send-keys -t "$session_name" C-m 2>/dev/null ) &
+    disown 2>/dev/null || true
   else
     tmux send-keys -t "$session_name" "claude" C-m || true
   fi
