@@ -2183,6 +2183,19 @@ cmd_create() {
     shift
   done
 
+  # Forge: auth pre-flight gate
+  local auth_check="${FOREMAN_HOME:-$HOME/.foreman}/bin/auth-check.sh"
+  if [ -x "$auth_check" ]; then
+    if ! "$auth_check" --quiet 2>&1; then
+      die "Auth pre-flight failed; run "$auth_check" manually to diagnose."
+    fi
+  fi
+
+  # Forge: circuit-breaker check
+  if ! check_circuit_breaker; then
+    die "Circuit breaker tripped — refusing to launch new session"
+  fi
+
   require_cmds gh jq tmux claude
   local repo_main
   repo_main="$(safe_repo_main "$repo")"
