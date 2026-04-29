@@ -3,10 +3,7 @@ set -euo pipefail
 IFS=$'\n\t'
 
 SCRIPT_NAME="acorn"
-PROJECTS_DIR="$HOME/projects"
-if [ -d "$HOME/Projects" ]; then
-  PROJECTS_DIR="$HOME/Projects"
-fi
+PROJECTS_DIR="${PROJECTS_DIR:-$HOME/projects}"
 LIFECYCLE_LABELS=("triage" "ready-for-spec" "spec-in-progress" "spec-review" "spec-approved" "implementing" "in-review" "done")
 CLARIFICATION_LABELS=("ai-drafted" "human-clarified")
 _SHOW_DEPS=0
