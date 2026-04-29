@@ -2254,6 +2254,15 @@ cmd_create() {
       send_auto_trigger "$session_name" "$(auto_trigger_message "$dir" "$mode")"
       info "Auto-trigger queued (waiting for readiness, up to ~30s)"
     fi
+
+    # Forge: record session launch for watchdog
+    local watchdog_state="${FOREMAN_HOME:-$HOME/.foreman}/watchdog-state"
+    if [ -d "$watchdog_state" ]; then
+      date -Iseconds > "$watchdog_state/launch_${session_name}" 2>/dev/null || true
+    fi
+
+    # Forge: register session with forged daemon
+    register_with_forged "$session_name" "$mode" "$dir"
   fi
 
   write_meta_json "$meta_path" "$repo" "$issue_number" "$title" "$slug" "tmux" "$session_name" "$mode"
@@ -3239,6 +3248,75 @@ cmd_issue_plan() {
   cmd_create "$repo" "$issue_num" "${create_flags[@]+"${create_flags[@]}"}"
 }
 
+cmd_setup_watchdog() {
+  local watchdog_script="$HOME/.foreman/bin/completion-watchdog.sh"
+  local log_dir="$HOME/.foreman/logs"
+  local state_dir="$HOME/.foreman/watchdog-state"
+  local user_path="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+  if [ ! -f "$watchdog_script" ]; then
+    die "Watchdog script not found at $watchdog_script -- deploy it first"
+  fi
+
+  chmod +x "$watchdog_script"
+  mkdir -p "$log_dir" "$state_dir"
+
+  # Bootstrap: pre-populate markers for already-completed work to avoid stale notifications
+  if [ "${1:-}" = "--bootstrap" ] || ! [ -f "$state_dir/.bootstrapped" ]; then
+    info "Bootstrapping: scanning for existing completions..."
+    "$watchdog_script" --bootstrap
+    date -Iseconds > "$state_dir/.bootstrapped"
+    info "Bootstrap complete -- existing completions will not trigger notifications"
+  fi
+
+  if command -v crontab >/dev/null 2>&1; then
+    local cron_line="* * * * * PATH=$user_path HOME=$HOME $watchdog_script >> $log_dir/watchdog.log 2>&1"
+
+    if crontab -l 2>/dev/null | grep -qF "completion-watchdog.sh"; then
+      info "Watchdog cron already installed"
+    else
+      (crontab -l 2>/dev/null || true; printf '%s\n' "$cron_line") | crontab -
+      info "Installed watchdog cron: runs every 60 seconds"
+    fi
+  else
+    warn "crontab not available -- using tmux fallback"
+    local interval="${WATCHDOG_INTERVAL_SECONDS:-60}"
+    if tmux has-session -t forge_watchdog 2>/dev/null; then
+      info "Watchdog tmux session already running"
+    else
+      tmux new-session -d -s forge_watchdog \
+        "while true; do PATH=$user_path $watchdog_script >> $log_dir/watchdog.log 2>&1; sleep $interval; done"
+      info "Watchdog running in tmux session: forge_watchdog (interval: ${interval}s)"
+    fi
+  fi
+
+  # --- Verify notification delivery path (R2) ---
+  info "Testing notification delivery..."
+  local verify_port="${TELEGRAM_NOTIFY_PORT:-8765}"
+  local verify_url="http://127.0.0.1:${verify_port}/notify"
+  local verify_msg="[watchdog-setup] Delivery test at $(date -Iseconds)"
+  local verify_payload
+  verify_payload="$(jq -nc --arg m "$verify_msg" '{message: $m}')"
+
+  if curl -fsS --max-time 10 \
+      -H "Content-Type: application/json" \
+      -d "$verify_payload" \
+      "$verify_url" >/dev/null 2>&1; then
+    info "PASS: Test notification delivered -- check Telegram for: $verify_msg"
+  else
+    warn "FAIL: Could not deliver test notification"
+    warn "  Bridge may not be running on port $verify_port"
+    warn "  Cron is installed, but notifications will fail until bridge is running"
+    warn "  Fix: Start the Telegram bridge, then re-run: acorn setup-watchdog"
+    exit 1
+  fi
+
+  info "Logs: $log_dir/watchdog.log"
+  info "Events: $log_dir/watchdog-events.jsonl"
+  info "State: $state_dir/"
+}
+
+
 cmd_doctor() {
   local repo="${1:-}"
   require_cmds python3 jq
@@ -3372,6 +3450,14 @@ main() {
     doctor)
       shift 1
       cmd_doctor "$@"
+      ;;
+    setup-watchdog)
+      shift 1
+      cmd_setup_watchdog "$@"
+      ;;
+    watchdog-reset)
+      shift 1
+      "$HOME/.foreman/bin/completion-watchdog.sh" --reset "${1:-all}"
       ;;
     clean)
       [ "$#" -ge 3 ] || { usage; exit 1; }
