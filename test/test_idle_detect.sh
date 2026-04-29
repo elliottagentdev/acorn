@@ -33,8 +33,10 @@ class StubDaemon(forged.ForgedDaemon):
         self.state_path = os.path.join(tmp, "forged-state.json")
         self.config_path = os.path.join(tmp, "concurrency-config.yaml")
         self.event_log_path = os.path.join(tmp, "logs", "forged-events.jsonl")
+        self.foreman_events_path = os.path.join(tmp, ".foreman-events.jsonl")
         self.breadcrumb_path = os.path.join(tmp, ".forged-last-run")
         self.state_lock = threading.Lock()
+        self._foreman_events_lock = threading.Lock()
         self.shutdown_event = threading.Event()
         self.config = dict(forged.DEFAULTS)
         self.state = self._empty_state()
@@ -47,6 +49,7 @@ class StubDaemon(forged.ForgedDaemon):
         self._cycle_notification_count = 0
         self._notifications = []
         self._events = []
+        self.nudge_queue_path = os.path.join(tmp, "nudge-queue.json")
         os.makedirs(os.path.join(tmp, "watchdog-state"), exist_ok=True)
         os.makedirs(os.path.join(tmp, "logs"), exist_ok=True)
 

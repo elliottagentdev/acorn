@@ -45,6 +45,17 @@ setup() {
   TMPDIR_BASE="$(mktemp -d)"
 }
 
+init_git_repo() {
+  local d="$1"
+  (
+    cd "$d"
+    git init -q
+    git config user.email test@example.com
+    git config user.name test
+    git remote add origin https://github.com/example/example.git
+  )
+}
+
 teardown() {
   [ -n "$TMPDIR_BASE" ] && rm -rf "$TMPDIR_BASE"
   unset -f gh safe_repo_main set_issue_state_label set_clarification_label ensure_labels 2>/dev/null || true
@@ -59,7 +70,7 @@ test_clarification_labels_constant() {
 
 test_lifecycle_labels_constant() {
   printf '\n\033[1m== LIFECYCLE_LABELS constant ==\033[0m\n'
-  assert_eq "array length" "${#LIFECYCLE_LABELS[@]}" "8"
+  assert_eq "array length" "${#LIFECYCLE_LABELS[@]}" "11"
   assert_eq "label 0" "${LIFECYCLE_LABELS[0]}" "triage"
   assert_eq "label 1" "${LIFECYCLE_LABELS[1]}" "ready-for-spec"
   assert_eq "label 2" "${LIFECYCLE_LABELS[2]}" "spec-in-progress"
@@ -67,7 +78,10 @@ test_lifecycle_labels_constant() {
   assert_eq "label 4" "${LIFECYCLE_LABELS[4]}" "spec-approved"
   assert_eq "label 5" "${LIFECYCLE_LABELS[5]}" "implementing"
   assert_eq "label 6" "${LIFECYCLE_LABELS[6]}" "in-review"
-  assert_eq "label 7" "${LIFECYCLE_LABELS[7]}" "done"
+  assert_eq "label 7" "${LIFECYCLE_LABELS[7]}" "review-pass"
+  assert_eq "label 8" "${LIFECYCLE_LABELS[8]}" "review-blocked"
+  assert_eq "label 9" "${LIFECYCLE_LABELS[9]}" "review-skipped"
+  assert_eq "label 10" "${LIFECYCLE_LABELS[10]}" "done"
 }
 
 test_clarification_for_issue() {
@@ -75,6 +89,7 @@ test_clarification_for_issue() {
 
   local tmpdir
   tmpdir="$(mktemp -d)"
+  init_git_repo "$tmpdir"
 
   gh() {
     echo '{"labels": [{"name": "spec-in-progress"}, {"name": "ai-drafted"}]}'
@@ -121,6 +136,7 @@ test_status_for_spec_reads_lifecycle_label() {
 
   local tmpdir
   tmpdir="$(mktemp -d)"
+  init_git_repo "$tmpdir"
   mkdir -p "$tmpdir/plans"
 
   gh() {
@@ -253,6 +269,7 @@ test_clarify_guard_prevents_regression() {
 
   local tmpdir
   tmpdir="$(mktemp -d)"
+  init_git_repo "$tmpdir"
 
   safe_repo_main() { printf '%s' "$tmpdir"; }
   export -f safe_repo_main
