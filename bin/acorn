@@ -50,6 +50,105 @@ notify_telegram() {
   disown
 }
 
+notify_foreman() {
+  local event_type="$1"
+  local message="$2"
+  local session="${3:-}"
+  local extra_data="${4:-{}}"
+
+  (
+    if ! command -v curl >/dev/null 2>&1; then
+      return 0
+    fi
+
+    if ! command -v jq >/dev/null 2>&1; then
+      local tg_payload
+      tg_payload="{\"message\": \"$message\"}"
+      curl -fsS --max-time 5 \
+        -H "Content-Type: application/json" \
+        -d "$tg_payload" \
+        "$TELEGRAM_NOTIFY_URL" >/dev/null 2>&1 || true
+      return 0
+    fi
+
+    if ! jq -e . >/dev/null 2>&1 <<<"$extra_data"; then
+      extra_data='{}'
+    fi
+
+    local payload
+    payload="$(jq -nc \
+      --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      --arg event "$event_type" \
+      --arg session "$session" \
+      --argjson data "$extra_data" \
+      '{ts: $ts, event: $event, source: "acorn", session: $session, data: $data}')"
+
+    local http_code
+    http_code=$(curl -s --max-time 3 \
+      -o /dev/null -w '%{http_code}' \
+      -X POST -H "Content-Type: application/json" \
+      -d "$payload" \
+      "http://localhost:7700/notify-foreman" 2>/dev/null) || http_code="0"
+
+    if [[ "$http_code" != "200" ]]; then
+      local tg_payload
+      if [ -n "$session" ]; then
+        tg_payload="$(jq -nc --arg m "$message" --arg s "$session" '{message: $m, session: $s}')"
+      else
+        tg_payload="$(jq -nc --arg m "$message" '{message: $m}')"
+      fi
+      curl -fsS --max-time 5 \
+        -H "Content-Type: application/json" \
+        -d "$tg_payload" \
+        "$TELEGRAM_NOTIFY_URL" >/dev/null 2>&1 || true
+    fi
+  ) &
+  disown
+}
+
+check_circuit_breaker() {
+  local forged_url="http://localhost:7700/status"
+  local response
+  set +e
+  response="$(curl -fsS --max-time 3 "$forged_url" 2>/dev/null)"
+  local ec=$?
+  set -e
+
+  if [ $ec -ne 0 ]; then
+    warn "Forged not reachable -- skipping circuit breaker check (fail-open)"
+    return 0
+  fi
+
+  local blocked
+  blocked="$(printf '%s' "$response" | jq -r '.acorn_circuit_breaker.blocked // false' 2>/dev/null)"
+  if [ "$blocked" = "true" ]; then
+    die "Acorn circuit breaker is TRIPPED (systemic idle failures). Reset via: curl -X POST localhost:7700/reset-acorn-circuit-breaker"
+  fi
+  return 0
+}
+
+register_with_forged() {
+  local session_name="$1"
+  local mode="$2"
+  local spec_dir="$3"
+  local payload
+  payload="$(jq -nc \
+    --arg session "$session_name" \
+    --arg type "acorn" \
+    --arg mode "$mode" \
+    --arg spec_dir "$spec_dir" \
+    '{session: $session, type: $type, meta: {mode: $mode, spec_dir: $spec_dir}}')"
+  (
+    curl -fsS --max-time 3 \
+      -H "Content-Type: application/json" \
+      -d "$payload" \
+      "http://localhost:7700/register" >/dev/null 2>&1 \
+      || true
+  ) &
+  disown
+}
+
+
 usage() {
   cat <<'EOF'
 Usage:
