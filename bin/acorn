@@ -1090,6 +1090,17 @@ Produce the FINAL, COMPLETE implementation specification. It MUST include:
 
 5. **Risk Register**: Unresolved risks with severity, likelihood, and mitigation strategies.
 
+6. **Pi Model Recommendation**: Based on the full context of this spec, emit a `## Pi Model Recommendation`
+   section at the top of SPEC.md (before ## 1. Requirements Traceability Matrix) containing exactly two lines:
+
+   suggested_pi_model: codex
+   suggested_pi_model_rationale: <one-line explanation>
+
+   Use value `codex` when: spec names specific files and functions, implementation is pattern-following,
+   touches < 8 files, introduces no new interfaces or schemas, includes explicit test commands.
+   Use value `opus` when: requirements are vague or exploratory, introduces new architectural patterns,
+   crosses subsystem boundaries, adds new interfaces or schemas, touches > 8 files with design judgment required.
+
 The spec must be ready to be handed to a developer or agent for implementation with ZERO questions.
 
 - Write the final spec to __SPEC_PATH__/plans/SPEC.md
@@ -1357,6 +1368,17 @@ Produce the FINAL, COMPLETE implementation specification. It MUST include:
 
 5. **Risk Register**: Unresolved risks with severity, likelihood, and mitigation strategies.
 
+6. **Pi Model Recommendation**: Based on the full context of this spec, emit a `## Pi Model Recommendation`
+   section at the top of SPEC.md (before ## 1. Requirements Traceability Matrix) containing exactly two lines:
+
+   suggested_pi_model: codex
+   suggested_pi_model_rationale: <one-line explanation>
+
+   Use value `codex` when: spec names specific files and functions, implementation is pattern-following,
+   touches < 8 files, introduces no new interfaces or schemas, includes explicit test commands.
+   Use value `opus` when: requirements are vague or exploratory, introduces new architectural patterns,
+   crosses subsystem boundaries, adds new interfaces or schemas, touches > 8 files with design judgment required.
+
 The spec must be ready to be handed to a developer or agent for implementation with ZERO questions.
 
 - Write the final spec to __SPEC_PATH__/plans/SPEC.md
@@ -1535,6 +1557,17 @@ The spec MUST include:
 
 4. **Risk Register**: Known risks with severity, likelihood, and mitigation strategies.
 
+5. **Pi Model Recommendation**: Based on the full context of this spec, emit a `## Pi Model Recommendation`
+   section at the top of SPEC.md (before ## 1. Requirements Traceability Matrix) containing exactly two lines:
+
+   suggested_pi_model: codex
+   suggested_pi_model_rationale: <one-line explanation>
+
+   Use value `codex` when: spec names specific files and functions, implementation is pattern-following,
+   touches < 8 files, introduces no new interfaces or schemas, includes explicit test commands.
+   Use value `opus` when: requirements are vague or exploratory, introduces new architectural patterns,
+   crosses subsystem boundaries, adds new interfaces or schemas, touches > 8 files with design judgment required.
+
 The spec must be ready to be handed to a developer or agent for implementation with ZERO questions.
 Be specific — reference actual file paths, function names, and code patterns from the recon documents.
 
@@ -1611,10 +1644,15 @@ render_prompt_md() {
 
 When implementation is complete, the implementing agent must:
 
-1. Create or update `DONE.md` in the spec directory.
+1. Create or update `DONE.md` in the spec directory (`.specs/<slug>/DONE.md`).
+   **IMPORTANT**: Always write to the spec directory, NOT the worktree root.
+   For non-repo work (scripts, config, behavioral specs), the spec directory
+   is at `<project_root>/<repo>/main/.specs/<slug>/DONE.md`.
 2. Include the exact test commands run and their outcomes.
-3. Summarize file changes and rationale in concise bullet points.
-4. List any follow-up risks or deferred work.
+3. For non-repo work, include a `## Work Type` section listing the category
+   and primary artifact paths.
+4. Summarize file changes and rationale in concise bullet points.
+5. List any follow-up risks or deferred work.
 EOF
   } > "$out_tmp"
 }
