@@ -10,6 +10,18 @@ TELEGRAM_NOTIFY_PORT="${TELEGRAM_NOTIFY_PORT:-8765}"
 TELEGRAM_NOTIFY_URL="http://127.0.0.1:${TELEGRAM_NOTIFY_PORT}/notify"
 _SHOW_DEPS=0
 _LIST_NWO=""
+
+# Ensure npm-global bin is on PATH so `claude` resolves in non-interactive shells
+# (e.g. Foreman background spawns).
+export PATH="/home/agentdev/.npm-global/bin${PATH:+:$PATH}"
+# Defense-in-depth (R-1b): warn if `claude` resolves outside the expected npm-global location.
+_claude_bin=$(command -v claude 2>/dev/null || true)
+case "$_claude_bin" in
+    "" | "/home/agentdev/.npm-global/bin/claude") ;;
+    *) printf '[WARN] claude resolved to unexpected path: %s
+' "$_claude_bin" >&2 ;;
+esac
+unset _claude_bin
 auto_trigger_message() {
   local spec_path="$1"
   local mode="${2:-full}"
