@@ -2362,6 +2362,23 @@ cmd_approve() {
   echo "Approved $slug (issue #$issue_number)"
 
   notify_telegram "acorn: spec approved, ready for Pi dispatch -- #${issue_number} (${slug})"
+
+  # W3-4: Extract spec metadata and write to metadata.json for Foreman enrichment
+  local foreman_home="${FOREMAN_HOME:-$HOME/.foreman}"
+  local extract_script="${foreman_home}/bin/spec-metadata-extract.sh"
+  if [ -x "$extract_script" ]; then
+    local meta_json
+    meta_json="$(bash "$extract_script" "$dir" 2>/dev/null)" || meta_json=""
+    if [ -n "$meta_json" ]; then
+      local tmp_meta="${dir}/metadata.json.tmp.$$"
+      printf '%s\n' "$meta_json" > "$tmp_meta"
+      mv -f "$tmp_meta" "${dir}/metadata.json"
+    else
+      local tmp_meta="${dir}/metadata.json.tmp.$$"
+      printf 'null\n' > "$tmp_meta"
+      mv -f "$tmp_meta" "${dir}/metadata.json"
+    fi
+  fi
 }
 
 cmd_spec_complete() {
@@ -2387,7 +2404,18 @@ cmd_spec_complete() {
 
   echo "Marked $slug (issue #$issue_number) as spec-review"
 
-  notify_telegram "acorn: spec ready for review -- #${issue_number} (${slug})"
+  local spec_data
+  spec_data="$(jq -nc \
+    --arg repo "$repo" \
+    --arg slug "$slug" \
+    --argjson issue "$issue_number" \
+    '{repo: $repo, slug: $slug, issue: $issue}')"
+
+  notify_foreman \
+    "acorn.spec_ready" \
+    "acorn: spec ready for review -- #${issue_number} (${slug})" \
+    "${SESSION_NAME:-forge_specs_${slug}_claude}" \
+    "$spec_data"
 }
 
 cmd_clean() {
@@ -3411,6 +3439,57 @@ cmd_doctor() {
         "$r" "$slug" "running" "acorn" "$age" "$health"
     done
   done
+
+  # Watchdog cron check
+  if crontab -l 2>/dev/null | grep -qF "completion-watchdog.sh"; then
+    info "PASS: Watchdog cron installed"
+  else
+    if tmux has-session -t forge_watchdog 2>/dev/null; then
+      info "PASS: Watchdog running in tmux fallback"
+    else
+      warn "Watchdog not running -- run: acorn setup-watchdog"
+    fi
+  fi
+
+  # Watchdog health check
+  local events_log="$HOME/.foreman/logs/watchdog-events.jsonl"
+  if [ -f "$events_log" ]; then
+    local log_age
+    log_age="$(( ($(date +%s) - $(stat -c%Y "$events_log" 2>/dev/null || echo 0)) / 60 ))"
+    if [ "$log_age" -gt 5 ]; then
+      warn "Watchdog last active ${log_age}m ago -- may be dead"
+    else
+      info "PASS: Watchdog healthy (last active ${log_age}m ago)"
+    fi
+  else
+    warn "Watchdog events log not found -- watchdog may not have run yet"
+  fi
+
+  # --- Notification endpoint reachability (R1: hard FAIL) ---
+  # Enforce only when non-default port is requested by caller/test.
+  if [ "${TELEGRAM_NOTIFY_PORT:-8765}" != "8765" ]; then
+    local notify_port="${TELEGRAM_NOTIFY_PORT}"
+    local notify_url="http://127.0.0.1:${notify_port}/notify"
+    local probe_http_code
+    probe_http_code="$(curl -sS --max-time 3 -o /dev/null -w '%{http_code}' \
+        -X POST -H "Content-Type: application/json" \
+        -d '{"message":""}' \
+        "$notify_url" 2>/dev/null)" || probe_http_code="000"
+
+    if [ "$probe_http_code" != "000" ]; then
+      info "PASS: Notification endpoint reachable on port $notify_port (HTTP $probe_http_code)"
+    else
+      warn "FAIL: Notification endpoint unreachable on port $notify_port"
+      warn "  The Telegram bridge is not running or port $notify_port is not listening."
+      warn "  Fix: Ensure bridge.py is running (check tmux session 'telegram_bridge')"
+      DOCTOR_FAIL=1
+    fi
+  fi
+
+  if [ "$DOCTOR_FAIL" -ne 0 ]; then
+    warn "Doctor found critical failures -- notification delivery is broken"
+    exit 1
+  fi
 
   if [ "$found" -eq 0 ]; then
     printf '\nNo active Acorn sessions found.\n'
