@@ -83,6 +83,15 @@ Encourage the user to clarify underspecified Job Story or Promise sections befor
 
 **Status values:** Actual lifecycle label from GitHub (for example: `triage`, `spec-in-progress`, `implementing`, `done`). Fallback for unlabeled legacy issues: `planning`, `review`, `unknown`.
 
+### Failure handling
+
+Acorn validates stage artifacts before stage advance via `acorn _internal validate-stage` instructions embedded in PROMPT.md.
+If validation fails, relaunch only failed sub-agent(s), waiting `ACORN_SUBAGENT_RETRY_BACKOFF_SECONDS` (default `30`) between retries.
+Retry budget is `ACORN_SUBAGENT_RETRY_BUDGET` per agent (default `1`).
+On retry exhaustion, halt diagnostics are written to `HALT.md` (`recon/HALT.md` for stage 0, `plans/HALT.md` for later stages).
+Set `ACORN_FAILURE_EVENT_PATH` to append JSONL `subagent.halt` events.
+`acorn list`/`status` prefix halted specs with `[HALTED]`; `acorn doctor` reports `HALTED PIPELINE` and exits non-zero.
+
 **Label lifecycle:** `triage` → `ready-for-spec` → `spec-in-progress` → `spec-review` → `spec-approved` → `implementing` → `in-review` → `done`
 
 **Clarification labels:** `ai-drafted` → `human-clarified` (orthogonal to spec lifecycle)
