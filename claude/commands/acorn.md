@@ -220,7 +220,16 @@ Specs are created at `~/Projects/<repo>/main/.specs/<issue#>-<slug>/`:
     validation.md                 -     Y     -
     red_team_1..4.md              Y     -     -
     SPEC.md                       Y     Y     Y
+    PLAN.md                       *     *     *   (* when ACORN_OUTPUT_MODE=three-artifact)
+    TASKS.md                      *     *     *   (* when ACORN_OUTPUT_MODE=three-artifact)
 ```
+
+### Output Modes
+
+- `ACORN_OUTPUT_MODE=single` (default): legacy behavior, outputs SPEC.md.
+- `ACORN_OUTPUT_MODE=three-artifact`: prompts for SPEC.md + PLAN.md + TASKS.md.
+
+The selected output mode is recorded in `.specs/<slug>/meta.json` as `output_mode` and used by `acorn approve` / `acorn spec-complete` to warn (non-fatal) if PLAN.md or TASKS.md is missing/empty.
 
 ## Image handling
 
