@@ -8,6 +8,9 @@ LIFECYCLE_LABELS=("triage" "ready-for-spec" "spec-in-progress" "spec-review" "sp
 CLARIFICATION_LABELS=("ai-drafted" "human-clarified")
 TELEGRAM_NOTIFY_PORT="${TELEGRAM_NOTIFY_PORT:-8765}"
 TELEGRAM_NOTIFY_URL="http://127.0.0.1:${TELEGRAM_NOTIFY_PORT}/notify"
+ACORN_SUBAGENT_RETRY_BUDGET="${ACORN_SUBAGENT_RETRY_BUDGET:-1}"
+ACORN_SUBAGENT_RETRY_BACKOFF_SECONDS="${ACORN_SUBAGENT_RETRY_BACKOFF_SECONDS:-30}"
+ACORN_FAILURE_EVENT_PATH="${ACORN_FAILURE_EVENT_PATH:-}"
 _SHOW_DEPS=0
 _LIST_NWO=""
 ACORN_OUTPUT_MODE="${ACORN_OUTPUT_MODE:-single}"
@@ -117,6 +120,100 @@ notify_foreman() {
     fi
   ) &
   disown
+}
+
+stage_manifest() {
+  local mode="$1" stage="$2"
+  case "$mode:$stage" in
+    full:0|lite:0|quick:0)
+      printf '%s\n' \
+        'recon/architecture.md|^## Directory Structure' \
+        'recon/relevant_code.md|^## ' \
+        'recon/conventions.md|^## '
+      ;;
+    full:1)
+      printf '%s\n' 'plans/draft_plan_1.md|^## ' 'plans/draft_plan_2.md|^## ' 'plans/draft_plan_3.md|^## ' 'plans/draft_plan_4.md|^## '
+      ;;
+    full:2) printf '%s\n' 'plans/evaluation.md|^## ' ;;
+    full:3) printf '%s\n' 'plans/master_plan.md|^## ' ;;
+    full:4)
+      printf '%s\n' 'plans/red_team_1.md|^## ' 'plans/red_team_2.md|^## ' 'plans/red_team_3.md|^## ' 'plans/red_team_4.md|^## '
+      ;;
+    full:5|lite:3|quick:1) printf '%s\n' 'plans/SPEC.md|^## ' ;;
+    lite:1) printf '%s\n' 'plans/draft.md|^## ' ;;
+    lite:2) printf '%s\n' 'plans/validation.md|^## ' ;;
+    *) die "Unknown stage manifest: mode=$mode stage=$stage" ;;
+  esac
+}
+
+stage_name() {
+  local mode="$1" stage="$2"
+  case "$mode:$stage" in
+    *:0) printf 'recon' ;;
+    full:1|lite:1) printf 'drafting' ;;
+    full:2|lite:2) printf 'validation' ;;
+    full:3) printf 'synthesis' ;;
+    full:4) printf 'red-team' ;;
+    full:5|lite:3|quick:1) printf 'final-spec' ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
+validate_stage_artifacts() {
+  local spec_dir="$1" mode="$2" stage="$3"
+  [ -d "$spec_dir" ] || { printf 'MISSING|%s\n' "$spec_dir" >&2; return 1; }
+  local manifest path header full rc=0
+  manifest="$(stage_manifest "$mode" "$stage")"
+  while IFS='|' read -r path header; do
+    [ -n "$path" ] || continue
+    full="$spec_dir/$path"
+    if [ ! -f "$full" ]; then printf 'MISSING|%s\n' "$path" >&2; rc=1; continue; fi
+    if [ ! -s "$full" ]; then printf 'EMPTY|%s\n' "$path" >&2; rc=1; continue; fi
+    if [ -n "$header" ] && ! grep -E -q -- "$header" "$full"; then
+      printf 'HEADER|%s|%s\n' "$path" "$header" >&2; rc=1
+    fi
+  done <<< "$manifest"
+  return "$rc"
+}
+
+emit_failure_event() {
+  local event_path="${ACORN_FAILURE_EVENT_PATH:-}"
+  [ -n "$event_path" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  local slug="${1:-}" stage="${2:-0}" sname="${3:-}" agent="${4:-}" artifact="${5:-}" retry_count="${6:-0}" retry_budget="${7:-0}" halt_reason="${8:-}" observed="${9:-}" mode="${10:-}" repo="${11:-}" issue_number="${12:-0}" session_name="${13:-}"
+  case "$stage" in ''|*[!0-9]*) stage=0;; esac
+  case "$retry_count" in ''|*[!0-9]*) retry_count=0;; esac
+  case "$retry_budget" in ''|*[!0-9]*) retry_budget=0;; esac
+  case "$issue_number" in ''|*[!0-9]*) issue_number=0;; esac
+  local payload
+  payload="$(jq -nc --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg slug "$slug" --argjson stage "$stage" --arg stage_name "$sname" --arg agent "$agent" --arg artifact "$artifact" --argjson retry_count "$retry_count" --argjson retry_budget "$retry_budget" --arg halt_reason "$halt_reason" --arg observed "$observed" --arg mode "$mode" --arg repo "$repo" --argjson issue_number "$issue_number" --arg session_name "$session_name" '{ts:$ts,source:"acorn",event:"subagent.halt",slug:$slug,repo:$repo,issue_number:$issue_number,mode:$mode,stage:$stage,stage_name:$stage_name,agent:$agent,artifact:$artifact,retry_count:$retry_count,retry_budget:$retry_budget,halt_reason:$halt_reason,observed:$observed,session_name:$session_name}' 2>/dev/null)" || return 0
+  mkdir -p "$(dirname "$event_path")" 2>/dev/null || true
+  printf '%s\n' "$payload" >> "$event_path" 2>/dev/null || true
+}
+
+halt_pipeline_diagnostic() {
+  local spec_dir="$1" mode="$2" stage="$3" agent="$4" artifact="$5" halt_reason="$6" observed="$7" agent_log_tail="${8:-(no output captured)}"
+  agent_log_tail="${agent_log_tail//\`\`\`/~~~}"
+  local stage_dir halt_path sname slug repo issue_number session_name ts body
+  case "$stage" in 0) stage_dir="$spec_dir/recon" ;; *) stage_dir="$spec_dir/plans" ;; esac
+  mkdir -p "$stage_dir" 2>/dev/null || true
+  halt_path="$stage_dir/HALT.md"
+  sname="$(stage_name "$mode" "$stage")"
+  slug="$(jq -r '.slug // ""' "$spec_dir/meta.json" 2>/dev/null || true)"
+  repo="$(jq -r '.repo // ""' "$spec_dir/meta.json" 2>/dev/null || true)"
+  issue_number="$(jq -r '.issue_number // 0' "$spec_dir/meta.json" 2>/dev/null || printf '0')"
+  session_name="$(jq -r '.session_name // ""' "$spec_dir/meta.json" 2>/dev/null || true)"
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  body="$(printf '# Pipeline Halt: stage %s (%s)\n\nHalted at: %s\nPipeline mode: %s\nSpec slug: %s\nRepo: %s\nStage: %s (%s)\nFailed agent: %s\nExpected artifact: %s\nObserved: %s\nRetry budget: %s\nHalt reason: %s\n\n## Last 50 lines of agent output\n\n```\n%s\n```\n\n## Suggested operator action\n\n    acorn clean %s %s --yes\n    acorn create %s %s --%s\n' "$stage" "$sname" "$ts" "$mode" "$slug" "$repo" "$stage" "$sname" "$agent" "$artifact" "$observed" "${ACORN_SUBAGENT_RETRY_BUDGET:-1}" "$halt_reason" "$agent_log_tail" "$repo" "$slug" "$repo" "$issue_number" "$mode")"
+  if ! printf '%s\n' "$body" > "$halt_path" 2>/dev/null; then warn "Failed to write $halt_path"; printf '%s\n' "$body" >&2; fi
+  warn "Pipeline halted: $sname stage (mode=$mode)"
+  warn "  Failed agent: $agent"
+  warn "  Expected artifact: $artifact"
+  warn "  Observed: $observed"
+  warn "  Halt reason: $halt_reason"
+  warn "  Diagnostic: $halt_path"
+  emit_failure_event "$slug" "$stage" "$sname" "$agent" "$artifact" "${ACORN_SUBAGENT_RETRY_BUDGET:-1}" "${ACORN_SUBAGENT_RETRY_BUDGET:-1}" "$halt_reason" "$observed" "$mode" "$repo" "$issue_number" "$session_name"
+  return 1
 }
 
 check_circuit_breaker() {
@@ -673,7 +770,19 @@ planning_block() {
 
 planning_block_full() {
   local spec_path="${1:-.}"
-  cat <<'METHODOLOGY_EOF' | sed "s|__SPEC_PATH__|${spec_path}|g"
+  local retry_budget="${ACORN_SUBAGENT_RETRY_BUDGET:-1}"
+  local retry_backoff="${ACORN_SUBAGENT_RETRY_BACKOFF_SECONDS:-30}"
+  local event_path="${ACORN_FAILURE_EVENT_PATH:-}"
+  local event_path_display="${event_path:-(unset — events disabled)}"
+  local mode="full"
+  case "$retry_budget" in ''|*[!0-9]*) retry_budget=1 ;; esac
+  case "$retry_backoff" in ''|*[!0-9]*) retry_backoff=30 ;; esac
+  cat <<'METHODOLOGY_EOF' \
+    | sed "s|__SPEC_PATH__|${spec_path}|g" \
+    | sed "s|__RETRY_BUDGET__|${retry_budget}|g" \
+    | sed "s|__RETRY_BACKOFF__|${retry_backoff}|g" \
+    | sed "s|__EVENT_PATH_DISPLAY__|${event_path_display}|g" \
+    | sed "s|__MODE__|${mode}|g"
 ## PLANNING METHODOLOGY — MANDATORY INSTRUCTIONS
 
 > **YOU ARE THE ORCHESTRATOR. YOU MUST FOLLOW THIS METHODOLOGY EXACTLY.**
@@ -781,7 +890,11 @@ CRITICAL SUB-AGENT INSTRUCTIONS:
 - Do NOT return any content, summaries, or explanations. ONLY the done message.
 ```
 
-**After all 3 complete:** Confirm all 3 files exist (__SPEC_PATH__/recon/architecture.md, __SPEC_PATH__/recon/relevant_code.md, __SPEC_PATH__/recon/conventions.md), then proceed to Stage 1. Do NOT read the files.
+**After all 3 complete (Recon Completeness Gate):**
+Run stage gate via Bash: `acorn _internal validate-stage "__SPEC_PATH__" __MODE__ 0`.
+If rc=1, relaunch ONLY failed agent(s), wait `__RETRY_BACKOFF__` seconds between retries, and retry up to `__RETRY_BUDGET__` times per agent.
+On exhaustion, run `acorn _internal halt "__SPEC_PATH__" __MODE__ 0 "<agent>" "<artifact>" <halt_reason> "<observed>"` and STOP.
+Proceed only if validation exits 0. Do NOT read the files.
 
 ---
 
@@ -854,7 +967,11 @@ CRITICAL SUB-AGENT INSTRUCTIONS:
 - Do NOT return any content, summaries, or explanations. ONLY the done message.
 ```
 
-**After all 4 complete:** Confirm all 4 files exist, then proceed to Stage 2. Do NOT read the files.
+**After all 4 complete (Stage 1 Gate):**
+Run stage gate via Bash: `acorn _internal validate-stage "__SPEC_PATH__" __MODE__ 1`.
+If rc=1, relaunch ONLY failed agent(s), wait `__RETRY_BACKOFF__` seconds between retries, and retry up to `__RETRY_BUDGET__` times per agent.
+On exhaustion, run `acorn _internal halt "__SPEC_PATH__" __MODE__ 1 "<agent>" "<artifact>" <halt_reason> "<observed>"` and STOP.
+Proceed only if validation exits 0. Do NOT read the files.
 
 ---
 
@@ -918,7 +1035,11 @@ Your output MUST include:
 - Do NOT return any content, summaries, or explanations. ONLY the done message.
 ```
 
-**After completion:** Confirm the file exists, then proceed to Stage 3. Do NOT read the file.
+**After completion (Stage 2 Gate):**
+Run stage gate via Bash: `acorn _internal validate-stage "__SPEC_PATH__" __MODE__ 2`.
+If rc=1, relaunch ONLY failed agent(s), wait `__RETRY_BACKOFF__` seconds between retries, and retry up to `__RETRY_BUDGET__` times per agent.
+On exhaustion, run `acorn _internal halt "__SPEC_PATH__" __MODE__ 2 "<agent>" "<artifact>" <halt_reason> "<observed>"` and STOP.
+Proceed only if validation exits 0. Do NOT read the file.
 
 ---
 
@@ -953,7 +1074,11 @@ Synthesize a master implementation plan using the evaluation to guide decisions:
 - Do NOT return any content, summaries, or explanations. ONLY the done message.
 ```
 
-**After completion:** Confirm the file exists, then proceed to Stage 4. Do NOT read the file.
+**After completion (Stage 3 Gate):**
+Run stage gate via Bash: `acorn _internal validate-stage "__SPEC_PATH__" __MODE__ 3`.
+If rc=1, relaunch ONLY failed agent(s), wait `__RETRY_BACKOFF__` seconds between retries, and retry up to `__RETRY_BUDGET__` times per agent.
+On exhaustion, run `acorn _internal halt "__SPEC_PATH__" __MODE__ 3 "<agent>" "<artifact>" <halt_reason> "<observed>"` and STOP.
+Proceed only if validation exits 0. Do NOT read the file.
 
 ---
 
@@ -1061,7 +1186,11 @@ Be adversarial. Think like a chaos engineer. What breaks under stress?
 - Do NOT return any content, summaries, or explanations. ONLY the done message.
 ```
 
-**After all 4 complete:** Confirm all 4 files exist, then proceed to Stage 5. Do NOT read the files.
+**After all 4 complete (Stage 4 Gate):**
+Run stage gate via Bash: `acorn _internal validate-stage "__SPEC_PATH__" __MODE__ 4`.
+If rc=1, relaunch ONLY failed agent(s), wait `__RETRY_BACKOFF__` seconds between retries, and retry up to `__RETRY_BUDGET__` times per agent.
+On exhaustion, run `acorn _internal halt "__SPEC_PATH__" __MODE__ 4 "<agent>" "<artifact>" <halt_reason> "<observed>"` and STOP.
+Proceed only if validation exits 0. Do NOT read the files.
 
 ---
 
@@ -1122,7 +1251,11 @@ The spec must be ready to be handed to a developer or agent for implementation w
 - Do NOT return any content, summaries, or explanations. ONLY the done message.
 ```
 
-**After completion:** Read __SPEC_PATH__/plans/SPEC.md and present it to the user. This is the ONLY file you read.
+**After completion (Final Stage Gate):**
+Run stage gate via Bash: `acorn _internal validate-stage "__SPEC_PATH__" __MODE__ 5`.
+If rc=1, relaunch ONLY failed agent(s), wait `__RETRY_BACKOFF__` seconds between retries, and retry up to `__RETRY_BUDGET__` times per agent.
+On exhaustion, run `acorn _internal halt "__SPEC_PATH__" __MODE__ 5 "<agent>" "<artifact>" <halt_reason> "<observed>"` and STOP.
+When validation exits 0, read __SPEC_PATH__/plans/SPEC.md and present it to the user. This is the ONLY file you read.
 
 ---
 
@@ -1135,13 +1268,25 @@ The spec must be ready to be handed to a developer or agent for implementation w
 - NEVER read sub-agent output files yourself (the ONLY exception: __SPEC_PATH__/plans/SPEC.md at the very end)
 - NEVER consume sub-agent return messages beyond confirming the word "Done"
 - NEVER write plan content yourself — that's what the 13 sub-agents are for
-- If a sub-agent fails, relaunch it. Do NOT do its work yourself as a fallback.
+- If validate-stage returns non-zero, relaunch ONLY failed agent(s), wait __RETRY_BACKOFF__ seconds, and retry up to __RETRY_BUDGET__ times per agent. On exhaustion run `acorn _internal halt ...` and STOP. Do NOT do failed work yourself as fallback.
 METHODOLOGY_EOF
 }
 
 planning_block_lite() {
   local spec_path="${1:-.}"
-  cat <<'METHODOLOGY_EOF' | sed "s|__SPEC_PATH__|${spec_path}|g"
+  local retry_budget="${ACORN_SUBAGENT_RETRY_BUDGET:-1}"
+  local retry_backoff="${ACORN_SUBAGENT_RETRY_BACKOFF_SECONDS:-30}"
+  local event_path="${ACORN_FAILURE_EVENT_PATH:-}"
+  local event_path_display="${event_path:-(unset — events disabled)}"
+  local mode="lite"
+  case "$retry_budget" in ''|*[!0-9]*) retry_budget=1 ;; esac
+  case "$retry_backoff" in ''|*[!0-9]*) retry_backoff=30 ;; esac
+  cat <<'METHODOLOGY_EOF' \
+    | sed "s|__SPEC_PATH__|${spec_path}|g" \
+    | sed "s|__RETRY_BUDGET__|${retry_budget}|g" \
+    | sed "s|__RETRY_BACKOFF__|${retry_backoff}|g" \
+    | sed "s|__EVENT_PATH_DISPLAY__|${event_path_display}|g" \
+    | sed "s|__MODE__|${mode}|g"
 ## PLANNING METHODOLOGY — MANDATORY INSTRUCTIONS (LITE MODE)
 
 > **YOU ARE THE ORCHESTRATOR. YOU MUST FOLLOW THIS METHODOLOGY EXACTLY.**
@@ -1251,7 +1396,11 @@ CRITICAL SUB-AGENT INSTRUCTIONS:
 - Do NOT return any content, summaries, or explanations. ONLY the done message.
 ```
 
-**After all 3 complete:** Confirm all 3 files exist (__SPEC_PATH__/recon/architecture.md, __SPEC_PATH__/recon/relevant_code.md, __SPEC_PATH__/recon/conventions.md), then proceed to Stage 1. Do NOT read the files.
+**After all 3 complete (Recon Completeness Gate):**
+Run stage gate via Bash: `acorn _internal validate-stage "__SPEC_PATH__" __MODE__ 0`.
+If rc=1, relaunch ONLY failed agent(s), wait `__RETRY_BACKOFF__` seconds between retries, and retry up to `__RETRY_BUDGET__` times per agent.
+On exhaustion, run `acorn _internal halt "__SPEC_PATH__" __MODE__ 0 "<agent>" "<artifact>" <halt_reason> "<observed>"` and STOP.
+Proceed only if validation exits 0. Do NOT read the files.
 
 ---
 
@@ -1284,7 +1433,11 @@ Be specific — reference actual file paths, function names, and code patterns f
 - Do NOT return any content, summaries, or explanations. ONLY the done message.
 ```
 
-**After completion:** Confirm the file exists, then proceed to Stage 2. Do NOT read the file.
+**After completion (Stage 1 Gate):**
+Run stage gate via Bash: `acorn _internal validate-stage "__SPEC_PATH__" __MODE__ 1`.
+If rc=1, relaunch ONLY failed agent(s), wait `__RETRY_BACKOFF__` seconds between retries, and retry up to `__RETRY_BUDGET__` times per agent.
+On exhaustion, run `acorn _internal halt "__SPEC_PATH__" __MODE__ 1 "<agent>" "<artifact>" <halt_reason> "<observed>"` and STOP.
+Proceed only if validation exits 0. Do NOT read the file.
 
 ---
 
@@ -1339,7 +1492,11 @@ For each major section:
 - Do NOT return any content, summaries, or explanations. ONLY the done message.
 ```
 
-**After completion:** Confirm the file exists, then proceed to Stage 3. Do NOT read the file.
+**After completion (Stage 2 Gate):**
+Run stage gate via Bash: `acorn _internal validate-stage "__SPEC_PATH__" __MODE__ 2`.
+If rc=1, relaunch ONLY failed agent(s), wait `__RETRY_BACKOFF__` seconds between retries, and retry up to `__RETRY_BUDGET__` times per agent.
+On exhaustion, run `acorn _internal halt "__SPEC_PATH__" __MODE__ 2 "<agent>" "<artifact>" <halt_reason> "<observed>"` and STOP.
+Proceed only if validation exits 0. Do NOT read the file.
 
 ---
 
@@ -1400,7 +1557,11 @@ The spec must be ready to be handed to a developer or agent for implementation w
 - Do NOT return any content, summaries, or explanations. ONLY the done message.
 ```
 
-**After completion:** Read __SPEC_PATH__/plans/SPEC.md and present it to the user. This is the ONLY file you read.
+**After completion (Final Stage Gate):**
+Run stage gate via Bash: `acorn _internal validate-stage "__SPEC_PATH__" __MODE__ 3`.
+If rc=1, relaunch ONLY failed agent(s), wait `__RETRY_BACKOFF__` seconds between retries, and retry up to `__RETRY_BUDGET__` times per agent.
+On exhaustion, run `acorn _internal halt "__SPEC_PATH__" __MODE__ 3 "<agent>" "<artifact>" <halt_reason> "<observed>"` and STOP.
+When validation exits 0, read __SPEC_PATH__/plans/SPEC.md and present it to the user. This is the ONLY file you read.
 
 ---
 
@@ -1413,13 +1574,25 @@ The spec must be ready to be handed to a developer or agent for implementation w
 - NEVER read sub-agent output files yourself (the ONLY exception: __SPEC_PATH__/plans/SPEC.md at the very end)
 - NEVER consume sub-agent return messages beyond confirming the word "Done"
 - NEVER write plan content yourself — that's what the 6 sub-agents are for
-- If a sub-agent fails, relaunch it. Do NOT do its work yourself as a fallback.
+- If validate-stage returns non-zero, relaunch ONLY failed agent(s), wait __RETRY_BACKOFF__ seconds, and retry up to __RETRY_BUDGET__ times per agent. On exhaustion run `acorn _internal halt ...` and STOP. Do NOT do failed work yourself as fallback.
 METHODOLOGY_EOF
 }
 
 planning_block_quick() {
   local spec_path="${1:-.}"
-  cat <<'METHODOLOGY_EOF' | sed "s|__SPEC_PATH__|${spec_path}|g"
+  local retry_budget="${ACORN_SUBAGENT_RETRY_BUDGET:-1}"
+  local retry_backoff="${ACORN_SUBAGENT_RETRY_BACKOFF_SECONDS:-30}"
+  local event_path="${ACORN_FAILURE_EVENT_PATH:-}"
+  local event_path_display="${event_path:-(unset — events disabled)}"
+  local mode="quick"
+  case "$retry_budget" in ''|*[!0-9]*) retry_budget=1 ;; esac
+  case "$retry_backoff" in ''|*[!0-9]*) retry_backoff=30 ;; esac
+  cat <<'METHODOLOGY_EOF' \
+    | sed "s|__SPEC_PATH__|${spec_path}|g" \
+    | sed "s|__RETRY_BUDGET__|${retry_budget}|g" \
+    | sed "s|__RETRY_BACKOFF__|${retry_backoff}|g" \
+    | sed "s|__EVENT_PATH_DISPLAY__|${event_path_display}|g" \
+    | sed "s|__MODE__|${mode}|g"
 ## PLANNING METHODOLOGY — MANDATORY INSTRUCTIONS (QUICK MODE)
 
 > **YOU ARE THE ORCHESTRATOR. YOU MUST FOLLOW THIS METHODOLOGY EXACTLY.**
@@ -1527,7 +1700,11 @@ CRITICAL SUB-AGENT INSTRUCTIONS:
 - Do NOT return any content, summaries, or explanations. ONLY the done message.
 ```
 
-**After all 3 complete:** Confirm all 3 files exist (__SPEC_PATH__/recon/architecture.md, __SPEC_PATH__/recon/relevant_code.md, __SPEC_PATH__/recon/conventions.md), then proceed to Stage 1. Do NOT read the files.
+**After all 3 complete (Recon Completeness Gate):**
+Run stage gate via Bash: `acorn _internal validate-stage "__SPEC_PATH__" __MODE__ 0`.
+If rc=1, relaunch ONLY failed agent(s), wait `__RETRY_BACKOFF__` seconds between retries, and retry up to `__RETRY_BUDGET__` times per agent.
+On exhaustion, run `acorn _internal halt "__SPEC_PATH__" __MODE__ 0 "<agent>" "<artifact>" <halt_reason> "<observed>"` and STOP.
+Proceed only if validation exits 0. Do NOT read the files.
 
 ---
 
@@ -1590,7 +1767,11 @@ Be specific — reference actual file paths, function names, and code patterns f
 - Do NOT return any content, summaries, or explanations. ONLY the done message.
 ```
 
-**After completion:** Read __SPEC_PATH__/plans/SPEC.md and present it to the user. This is the ONLY file you read.
+**After completion (Final Stage Gate):**
+Run stage gate via Bash: `acorn _internal validate-stage "__SPEC_PATH__" __MODE__ 1`.
+If rc=1, relaunch ONLY failed agent(s), wait `__RETRY_BACKOFF__` seconds between retries, and retry up to `__RETRY_BUDGET__` times per agent.
+On exhaustion, run `acorn _internal halt "__SPEC_PATH__" __MODE__ 1 "<agent>" "<artifact>" <halt_reason> "<observed>"` and STOP.
+When validation exits 0, read __SPEC_PATH__/plans/SPEC.md and present it to the user. This is the ONLY file you read.
 
 ---
 
@@ -1603,7 +1784,7 @@ Be specific — reference actual file paths, function names, and code patterns f
 - NEVER read sub-agent output files yourself (the ONLY exception: __SPEC_PATH__/plans/SPEC.md at the very end)
 - NEVER consume sub-agent return messages beyond confirming the word "Done"
 - NEVER write plan content yourself — that's what the 4 sub-agents are for
-- If a sub-agent fails, relaunch it. Do NOT do its work yourself as a fallback.
+- If validate-stage returns non-zero, relaunch ONLY failed agent(s), wait __RETRY_BACKOFF__ seconds, and retry up to __RETRY_BUDGET__ times per agent. On exhaustion run `acorn _internal halt ...` and STOP. Do NOT do failed work yourself as fallback.
 METHODOLOGY_EOF
 }
 
@@ -1708,6 +1889,9 @@ validate_prompt_md() {
   grep -q 'PLANNING METHODOLOGY — MANDATORY INSTRUCTIONS' "$prompt_path" || return 1
   if [ "$output_mode" = "three-artifact" ]; then
     grep -q 'THREE-ARTIFACT OUTPUT MODE' "$prompt_path" || return 1
+  fi
+  if grep -E -q '__SPEC_PATH__|__RETRY_BUDGET__|__RETRY_BACKOFF__|__EVENT_PATH_DISPLAY__|__MODE__' "$prompt_path"; then
+    return 1
   fi
   return 0
 }
@@ -2039,6 +2223,11 @@ status_for_spec() {
   local repo_main="$1"
   local issue_number="$2"
   local spec_path="$3"
+  local halted=0
+  [ -f "$spec_path/recon/HALT.md" ] && halted=1
+  [ -f "$spec_path/plans/HALT.md" ] && halted=1
+  local prefix=""
+  [ "$halted" -eq 1 ] && prefix='[HALTED] '
 
   local labels_json='[]'
   if [ -n "$issue_number" ]; then
@@ -2057,7 +2246,7 @@ status_for_spec() {
   done
 
   if [ -n "$found" ]; then
-    printf '%s' "$found"
+    printf '%s%s' "$prefix" "$found"
   else
     # Backward-compatible fallback for older unlabeled issues.
     local final_exists=0
@@ -2066,11 +2255,11 @@ status_for_spec() {
     [ -f "$spec_path/PROMPT.md" ] && prompt_exists=1
 
     if [ "$final_exists" -eq 1 ]; then
-      printf 'review'
+      printf '%sreview' "$prefix"
     elif [ "$prompt_exists" -eq 1 ]; then
-      printf 'planning'
+      printf '%splanning' "$prefix"
     else
-      printf 'unknown'
+      printf '%sunknown' "$prefix"
     fi
   fi
 }
@@ -3495,9 +3684,40 @@ cmd_setup_watchdog() {
 }
 
 
+cmd_internal() {
+  local sub="${1:-}"
+  shift || true
+  case "$sub" in
+    validate-stage)
+      [ "$#" -eq 3 ] || die "Usage: acorn _internal validate-stage <spec_dir> <mode> <stage>"
+      validate_stage_artifacts "$1" "$2" "$3"
+      ;;
+    halt)
+      [ "$#" -ge 7 ] || die "Usage: acorn _internal halt <spec_dir> <mode> <stage> <agent> <artifact> <halt_reason> <observed> [<agent_log_tail>]"
+      local sd="$1"
+      case "$sd" in
+        "${PROJECTS_DIR%/}"/*/main/.specs/*) ;;
+        *) die "Refusing halt: unsafe spec_dir path: $sd" ;;
+      esac
+      halt_pipeline_diagnostic "$@"
+      ;;
+    emit-failure-event)
+      emit_failure_event "$@"
+      ;;
+    stage-manifest)
+      [ "$#" -eq 2 ] || die "Usage: acorn _internal stage-manifest <mode> <stage>"
+      stage_manifest "$1" "$2"
+      ;;
+    *)
+      die "Unknown _internal subcommand: $sub"
+      ;;
+  esac
+}
+
 cmd_doctor() {
   local repo="${1:-}"
   require_cmds python3 jq
+  DOCTOR_FAIL=0
 
   local hang_check_script="${FOREMAN_HOME:-$HOME/.foreman}/bin/hang-detect.sh"
   local use_external=1
@@ -3623,6 +3843,18 @@ cmd_doctor() {
     fi
   fi
 
+  local halt_pat halt_file halt_relpath
+  for halt_pat in "$PROJECTS_DIR"/*/main/.specs/*/recon/HALT.md \
+                  "$PROJECTS_DIR"/*/main/.specs/*/plans/HALT.md; do
+    for halt_file in $halt_pat; do
+      [ -f "$halt_file" ] || continue
+      halt_relpath="${halt_file#"$PROJECTS_DIR/"}"
+      warn "HALTED PIPELINE: $halt_relpath"
+      warn "  $(head -n 1 "$halt_file" 2>/dev/null || true)"
+      DOCTOR_FAIL=1
+    done
+  done
+
   if [ "$DOCTOR_FAIL" -ne 0 ]; then
     warn "Doctor found critical failures -- notification delivery is broken"
     exit 1
@@ -3683,6 +3915,10 @@ main() {
     setup-watchdog)
       shift 1
       cmd_setup_watchdog "$@"
+      ;;
+    _internal)
+      shift 1
+      cmd_internal "$@"
       ;;
     watchdog-reset)
       shift 1

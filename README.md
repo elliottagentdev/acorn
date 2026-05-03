@@ -285,6 +285,14 @@ Output shows repo, issue number, slug, status, mode, age, clarification status, 
   - `review` — plans/SPEC.md exists, ready for human review
   - `unknown` — spec directory exists but state is unclear
 
+### Failure handling
+
+Acorn validates stage artifacts before stage advance via `acorn _internal validate-stage` instructions embedded in PROMPT.md.
+If a sub-agent fails to produce expected artifacts, orchestrators retry failed agent(s) with backoff.
+Defaults are `ACORN_SUBAGENT_RETRY_BUDGET=1` and `ACORN_SUBAGENT_RETRY_BACKOFF_SECONDS=30`.
+On retry exhaustion, the pipeline halts and writes `HALT.md` under `.specs/<slug>/recon/` (stage 0) or `.specs/<slug>/plans/` (later stages).
+Set `ACORN_FAILURE_EVENT_PATH=/path/to/events.jsonl` to append machine-readable `subagent.halt` JSONL events.
+
 ### Session dashboard
 
 ```bash
