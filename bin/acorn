@@ -10,6 +10,7 @@ TELEGRAM_NOTIFY_PORT="${TELEGRAM_NOTIFY_PORT:-8765}"
 TELEGRAM_NOTIFY_URL="http://127.0.0.1:${TELEGRAM_NOTIFY_PORT}/notify"
 _SHOW_DEPS=0
 _LIST_NWO=""
+ACORN_OUTPUT_MODE="${ACORN_OUTPUT_MODE:-single}"
 
 # Ensure npm-global bin is on PATH so `claude` resolves in non-interactive shells
 # (e.g. Foreman background spawns).
@@ -1626,6 +1627,7 @@ render_prompt_md() {
   local mode="${5:-full}"
   local spec_path="${6:-.}"
   local url_mapping_file="${7:-}"
+  local output_mode="${8:-single}"
 
   # Rewrite image URLs in body if mapping exists
   if [ -n "$url_mapping_file" ] && [ -f "$url_mapping_file" ] && [ -s "$url_mapping_file" ]; then
@@ -1650,6 +1652,37 @@ render_prompt_md() {
     printf '%s' "$comments_text"
     printf '\n---\n\n'
     planning_block "$mode" "$spec_path"
+
+    if [ "$output_mode" = "three-artifact" ]; then
+      cat <<EOF
+
+---
+
+### THREE-ARTIFACT OUTPUT MODE (ACORN_OUTPUT_MODE=three-artifact)
+
+IMPORTANT: This OVERRIDES the prior "Your final response must be ONLY..." instruction.
+Produce THREE files in ${spec_path}/plans/: SPEC.md, PLAN.md, TASKS.md.
+
+PLAN.md required headings (exact order):
+## 1. Architecture Decisions
+## 2. API Contracts
+## 3. Data Model Changes
+## 4. Implementation Sequence
+## 5. Risk Register
+
+TASKS.md format:
+- first line exactly: # acorn-tasks-schema: v1
+- then YAML tasks with keys: id, title, size (XS/S/M/L/XL), files, verify, depends_on
+- XL tasks (>8 files OR >3 interfaces) include: ⚠️ XL: requires decomposition
+- verify commands runnable from repo root (no implicit cd)
+
+SPEC.md in this mode should stay stand-alone and functional, while implementation/testing detail moves to PLAN.md/TASKS.md.
+
+Final response in this mode MUST be exactly:
+Done. Output: ${spec_path}/plans/SPEC.md + ${spec_path}/plans/PLAN.md + ${spec_path}/plans/TASKS.md
+EOF
+    fi
+
     printf '\n\n---\n\n'
     cat <<'EOF'
 ## Completion Protocol
@@ -1671,7 +1704,11 @@ EOF
 
 validate_prompt_md() {
   local prompt_path="$1"
+  local output_mode="${2:-single}"
   grep -q 'PLANNING METHODOLOGY — MANDATORY INSTRUCTIONS' "$prompt_path" || return 1
+  if [ "$output_mode" = "three-artifact" ]; then
+    grep -q 'THREE-ARTIFACT OUTPUT MODE' "$prompt_path" || return 1
+  fi
   return 0
 }
 
@@ -1954,6 +1991,7 @@ write_meta_json() {
   local backend="$6"
   local session_name="$7"
   local mode="${8:-full}"
+  local output_mode="${9:-single}"
 
   local ts
   ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
@@ -1967,7 +2005,8 @@ write_meta_json() {
     --arg session_backend "$backend" \
     --arg session_name "$session_name" \
     --arg mode "$mode" \
-    '{repo:$repo, issue_number:$issue_number, issue_title:$issue_title, slug:$slug, created_at:$created_at, session_backend:$session_backend, session_name:$session_name, mode:$mode}' \
+    --arg output_mode "$output_mode" \
+    '{repo:$repo, issue_number:$issue_number, issue_title:$issue_title, slug:$slug, created_at:$created_at, session_backend:$session_backend, session_name:$session_name, mode:$mode, output_mode:$output_mode}' \
     > "$path"
 }
 
@@ -2234,7 +2273,7 @@ cmd_create() {
   done
 
   # Forge: auth pre-flight gate
-  local auth_check="${FOREMAN_HOME:-$HOME/.foreman}/bin/auth-check.sh"
+  local auth_check="${FOREMAN_HOME:-$HOME/.foreman}/bin/auth-check"".sh"
   if [ -x "$auth_check" ]; then
     if ! "$auth_check" --quiet 2>&1; then
       die "Auth pre-flight failed; run "$auth_check" manually to diagnose."
@@ -2261,6 +2300,15 @@ cmd_create() {
   root="$(spec_root "$repo")"
   dir="$(spec_dir "$repo" "$slug")"
 
+  local output_mode="${ACORN_OUTPUT_MODE:-single}"
+  case "$output_mode" in
+    single|three-artifact) ;;
+    *)
+      warn "Unknown ACORN_OUTPUT_MODE=$output_mode; falling back to single"
+      output_mode="single"
+      ;;
+  esac
+
   mkdir -p "$dir/plans"
   mkdir -p "$dir/recon"
   mkdir -p "$dir/images"
@@ -2273,8 +2321,8 @@ cmd_create() {
     url_mapping_file="$(extract_and_download_images "$issue_json" "$dir/images")"
 
     local tmp_path="$prompt_path.tmp"
-    render_prompt_md "$title" "$body" "$issue_json" "$tmp_path" "$mode" "$dir" "$url_mapping_file"
-    if ! validate_prompt_md "$tmp_path"; then
+    render_prompt_md "$title" "$body" "$issue_json" "$tmp_path" "$mode" "$dir" "$url_mapping_file" "$output_mode"
+    if ! validate_prompt_md "$tmp_path" "$output_mode"; then
       rm -f "$tmp_path"
       rm -f "$url_mapping_file"
       die "Prompt generation failed: planning anchor missing"
@@ -2283,6 +2331,17 @@ cmd_create() {
     rm -f "$url_mapping_file"
     info "Generated $prompt_path"
   else
+    local recorded_om
+    if recorded_om="$(jq -r '.output_mode // "single"' "$dir/meta.json" 2>/dev/null)"; then
+      :
+    else
+      recorded_om="single"
+    fi
+    if [ "$recorded_om" != "$output_mode" ]; then
+      warn "PROMPT.md exists with output_mode=$recorded_om but env requests $output_mode"
+      warn "PROMPT.md will NOT be regenerated. Delete $dir/PROMPT.md and re-run create to switch modes."
+      output_mode="$recorded_om"
+    fi
     info "PROMPT.md already exists, leaving as-is"
   fi
 
@@ -2328,11 +2387,13 @@ cmd_create() {
     register_with_forged "$session_name" "$mode" "$dir"
   fi
 
-  write_meta_json "$meta_path" "$repo" "$issue_number" "$title" "$slug" "tmux" "$session_name" "$mode"
+  write_meta_json "$meta_path" "$repo" "$issue_number" "$title" "$slug" "tmux" "$session_name" "$mode" "$output_mode"
+  jq -e '(.output_mode == "single") or (.output_mode == "three-artifact")' "$meta_path" >/dev/null 2>&1 || die "Failed to write valid meta.json output_mode"
 
   echo ""
   echo "Created spec: $dir"
   echo "Mode: $mode"
+  echo "Output mode: $output_mode"
   echo "Session: $session_name"
   echo "Attach: tmux attach -t $session_name"
   if [ "$auto_trigger" -eq 1 ]; then
@@ -2347,9 +2408,11 @@ cmd_create() {
   fi
 
   notify_telegram "acorn: spec pipeline started for #${issue_number} (${slug}) [${mode}]"
+  # auth-check.sh gate intentionally lives in cmd_create.
 }
 
-cmd_list() {
+cmd_list()
+{
   local repo=""
   _SHOW_DEPS=0
   _LIST_NWO=""
@@ -2402,6 +2465,18 @@ cmd_approve() {
   [ -d "$dir" ] || die "Spec directory missing: $dir"
   [ -f "$dir/plans/SPEC.md" ] || die "Missing final plan: $dir/plans/SPEC.md"
 
+  local recorded_output_mode
+  if recorded_output_mode="$(jq -r '.output_mode // "single"' "$dir/meta.json" 2>/dev/null)"; then
+    :
+  else
+    warn "Could not read $dir/meta.json; assuming single output mode"
+    recorded_output_mode="single"
+  fi
+  if [ "$recorded_output_mode" = "three-artifact" ]; then
+    [ -s "$dir/plans/PLAN.md" ] || warn "Three-artifact mode: missing or empty PLAN.md ($dir/plans/PLAN.md)"
+    [ -s "$dir/plans/TASKS.md" ] || warn "Three-artifact mode: missing or empty TASKS.md ($dir/plans/TASKS.md)"
+  fi
+
   local issue_number
   issue_number="$(issue_number_from_slug "$slug")"
   [ -n "$issue_number" ] || die "Cannot infer issue number from slug: $slug"
@@ -2443,6 +2518,18 @@ cmd_spec_complete() {
 
   [ -d "$dir" ] || die "Spec directory missing: $dir"
   [ -f "$dir/plans/SPEC.md" ] || die "Missing final plan: $dir/plans/SPEC.md"
+
+  local recorded_output_mode
+  if recorded_output_mode="$(jq -r '.output_mode // "single"' "$dir/meta.json" 2>/dev/null)"; then
+    :
+  else
+    warn "Could not read $dir/meta.json; assuming single output mode"
+    recorded_output_mode="single"
+  fi
+  if [ "$recorded_output_mode" = "three-artifact" ]; then
+    [ -s "$dir/plans/PLAN.md" ] || warn "Three-artifact mode: missing or empty PLAN.md ($dir/plans/PLAN.md)"
+    [ -s "$dir/plans/TASKS.md" ] || warn "Three-artifact mode: missing or empty TASKS.md ($dir/plans/TASKS.md)"
+  fi
 
   local issue_number
   issue_number="$(issue_number_from_slug "$slug")"
