@@ -1,0 +1,12 @@
+{
+  "file_count": 67,
+  "new_interfaces": true,
+  "schema_changes": true,
+  "risk_level": null,
+  "test_count": 0,
+  "xl_task_count": 0,
+  "section_count": 13,
+  "dependency_declarations": null,
+  "suggested_pi_model": "codex",
+  "suggested_pi_model_rationale": "Single-file Bash edit with named functions, exact line numbers, explicit test commands, < 8 files touched, no new interfaces or schemas beyond a documented env var, and pattern-following implementation throughout."
+}

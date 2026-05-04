@@ -1,0 +1,12 @@
+{
+  "file_count": 60,
+  "new_interfaces": true,
+  "schema_changes": false,
+  "risk_level": null,
+  "test_count": 0,
+  "xl_task_count": 0,
+  "section_count": 17,
+  "dependency_declarations": null,
+  "suggested_pi_model": "codex",
+  "suggested_pi_model_rationale": "Spec names exact files, line numbers, and function signatures; implementation is pattern-following against existing acorn idioms (validate_prompt_md, notify_foreman, write_meta_json); touches < 8 files; introduces no new interfaces; includes explicit test commands."
+}

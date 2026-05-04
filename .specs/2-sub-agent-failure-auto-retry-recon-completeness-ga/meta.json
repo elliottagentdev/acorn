@@ -1,0 +1,10 @@
+{
+  "repo": "acorn",
+  "issue_number": 2,
+  "issue_title": "Sub-agent failure auto-retry + recon completeness gate before stage advance",
+  "slug": "2-sub-agent-failure-auto-retry-recon-completeness-ga",
+  "created_at": "2026-05-03T05:46:20Z",
+  "session_backend": "tmux",
+  "session_name": "acorn_specs_2-sub-agent-failure-auto-retry-recon-completeness-ga_claude",
+  "mode": "lite"
+}
