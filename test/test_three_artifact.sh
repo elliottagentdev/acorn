@@ -59,7 +59,11 @@ write_meta_json "$MOCK_SPEC/meta.json" r 1 t s tmux sess lite three-artifact
 spec_dir(){ printf '%s' "$MOCK_SPEC"; }; export -f spec_dir
 safe_repo_main(){ printf '%s' "$TMP/repo"; }; export -f safe_repo_main
 ensure_labels(){ :; }; set_issue_state_label(){ :; }; comment_issue(){ :; }; notify_telegram(){ :; }
-export -f ensure_labels set_issue_state_label comment_issue notify_telegram
+# This test exercises the three-artifact warning path only; mock the new
+# commit_spec_dir / amend_spec_metadata helpers (#154) as no-ops so the test
+# repo stub does not need to be a real git repo.
+commit_spec_dir(){ :; }; commit_spec_dir_on_branch(){ :; }; amend_spec_metadata(){ :; }
+export -f ensure_labels set_issue_state_label comment_issue notify_telegram commit_spec_dir commit_spec_dir_on_branch amend_spec_metadata
 stderr="$TMP/e"; cmd_approve r 1-s 2>"$stderr" >/dev/null || true
 assert_contains "approve warns plan" "$(cat "$stderr")" "missing or empty PLAN.md"
 

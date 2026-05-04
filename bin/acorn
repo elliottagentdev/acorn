@@ -265,7 +265,7 @@ Usage:
   acorn create <repo> <issue-number> [--no-auto] [--lite | --quick]
   acorn list [repo] [--deps]
   acorn status [repo]
-  acorn approve <repo> <slug>
+  acorn approve <repo> <slug> [--no-commit] [--orphan-branch <branch>]
   acorn spec-complete <repo> <slug>
   acorn clean <repo> <slug> [--remove-labels] [--yes] [--force]
   acorn doctor [repo]
@@ -2641,19 +2641,192 @@ cmd_status() {
   fi
 }
 
+# commit_spec_dir(slug, repo_main) -- commit .specs/<slug>/ on ${ACORN_COMMIT_BRANCH:-main}.
+# Captures caller branch and restores on success and failure paths. Idempotent.
+# Pathspec-limited so unrelated dirty/staged files are NEVER swept in.
+commit_spec_dir() {
+  local slug="$1"
+  local repo_main="$2"
+  local rel=".specs/${slug}"
+  local target_branch="${ACORN_COMMIT_BRANCH:-main}"
+
+  [ -d "$repo_main/$rel" ] || die "spec dir not found: $repo_main/$rel"
+
+  local original_branch
+  original_branch="$(cd "$repo_main" && git symbolic-ref --quiet --short HEAD)" \
+    || die "repo_main is in detached HEAD; refusing to commit"
+
+  info "Attempting to commit $rel on branch $target_branch (caller was on $original_branch)"
+
+  local rc=0
+  if ! (
+    set -e
+    cd "$repo_main"
+    if [ "$original_branch" != "$target_branch" ]; then
+      git checkout "$target_branch"
+    fi
+    if git diff --quiet -- "$rel" \
+       && git diff --cached --quiet -- "$rel" \
+       && [ -z "$(git ls-files --others --exclude-standard -- "$rel")" ]; then
+      info "$rel already committed (idempotent skip)"
+      exit 0
+    fi
+    git add -- "$rel"
+    git commit -m "spec: commit ${slug} for dispatch (acorn approve)" -- "$rel"
+    info "Committed $rel on branch $target_branch"
+  ); then
+    rc=$?
+  fi
+
+  if [ "$original_branch" != "$target_branch" ]; then
+    if ! ( cd "$repo_main" && git checkout "$original_branch" ); then
+      warn "Failed to restore branch $original_branch on $repo_main; manual intervention may be needed"
+    fi
+  fi
+
+  [ "$rc" -eq 0 ] || die "commit_spec_dir failed for $rel"
+}
+
+# commit_spec_dir_on_branch(slug, repo_main, target_branch) -- --orphan-branch variant.
+# Creates target_branch if missing. Always restores caller branch.
+commit_spec_dir_on_branch() {
+  local slug="$1"
+  local repo_main="$2"
+  local target_branch="$3"
+  local rel=".specs/${slug}"
+
+  [ -n "$target_branch" ] || die "commit_spec_dir_on_branch: target_branch is required"
+  [ -d "$repo_main/$rel" ] || die "spec dir not found: $repo_main/$rel"
+
+  local original_branch
+  original_branch="$(cd "$repo_main" && git symbolic-ref --quiet --short HEAD)" \
+    || die "repo_main is in detached HEAD; refusing to commit"
+
+  info "Attempting to commit $rel on orphan branch $target_branch (caller was on $original_branch)"
+
+  local rc=0
+  if ! (
+    set -e
+    cd "$repo_main"
+    if git show-ref --verify --quiet "refs/heads/$target_branch"; then
+      git checkout "$target_branch"
+    else
+      git checkout -b "$target_branch"
+    fi
+    if git diff --quiet -- "$rel" \
+       && git diff --cached --quiet -- "$rel" \
+       && [ -z "$(git ls-files --others --exclude-standard -- "$rel")" ]; then
+      info "$rel already committed on $target_branch (idempotent skip)"
+      exit 0
+    fi
+    git add -- "$rel"
+    git commit -m "spec: commit ${slug} for dispatch (acorn approve)" -- "$rel"
+    info "Committed $rel on orphan branch $target_branch"
+  ); then
+    rc=$?
+  fi
+
+  if ! ( cd "$repo_main" && git checkout "$original_branch" ); then
+    warn "Failed to restore branch $original_branch on $repo_main; commit may have succeeded but worktree is on $target_branch"
+  fi
+
+  [ "$rc" -eq 0 ] || die "commit_spec_dir_on_branch failed for $rel"
+}
+
+# amend_spec_metadata(slug, repo_main) -- fold metadata.json into spec commit if HEAD matches;
+# else create standalone "spec: metadata for <slug>" commit. Idempotent (skips if metadata.json
+# matches HEAD content). Operates on ${ACORN_COMMIT_BRANCH:-main}; restores caller branch.
+amend_spec_metadata() {
+  local slug="$1"
+  local repo_main="$2"
+  local rel=".specs/${slug}/metadata.json"
+  local target_branch="${ACORN_COMMIT_BRANCH:-main}"
+  local expected_prefix="spec: commit ${slug} for dispatch"
+
+  [ -f "$repo_main/$rel" ] || return 0
+
+  local original_branch
+  original_branch="$(cd "$repo_main" && git symbolic-ref --quiet --short HEAD)" \
+    || die "repo_main is in detached HEAD; refusing to amend"
+
+  local rc=0
+  if ! (
+    set -e
+    cd "$repo_main"
+    if [ "$original_branch" != "$target_branch" ]; then
+      git checkout "$target_branch"
+    fi
+    # Idempotent guard: skip if metadata.json content matches HEAD content already
+    if git ls-files --error-unmatch -- "$rel" >/dev/null 2>&1 \
+       && git diff --quiet HEAD -- "$rel" 2>/dev/null; then
+      info "metadata.json unchanged vs HEAD; skipping amend (idempotent)"
+      exit 0
+    fi
+    local head_subject
+    head_subject="$(git log -1 --format=%s)"
+    if [ "${head_subject:0:${#expected_prefix}}" = "$expected_prefix" ]; then
+      git add -- "$rel"
+      git commit --amend --no-edit -- "$rel"
+      info "metadata.json folded into spec commit"
+    else
+      warn "HEAD subject does not match spec commit; creating standalone metadata commit"
+      git add -- "$rel"
+      git commit -m "spec: metadata for ${slug}" -- "$rel"
+    fi
+  ); then
+    rc=$?
+  fi
+
+  if [ "$original_branch" != "$target_branch" ]; then
+    if ! ( cd "$repo_main" && git checkout "$original_branch" ); then
+      warn "Failed to restore branch $original_branch on $repo_main"
+    fi
+  fi
+
+  [ "$rc" -eq 0 ] || die "amend_spec_metadata failed for $rel"
+}
+
 cmd_approve() {
   local repo="$1"
   local slug="$2"
+  shift 2
 
-  require_cmds gh jq
+  # Phase 1: parse flags
+  local no_commit=0
+  local orphan_branch=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --no-commit)
+        no_commit=1
+        ;;
+      --orphan-branch)
+        [ "$#" -ge 2 ] || die "--orphan-branch requires a value"
+        orphan_branch="$2"
+        shift
+        ;;
+      *)
+        die "Unknown option for approve: $1"
+        ;;
+    esac
+    shift
+  done
+
+  # Phase 2: mutual-exclusion check
+  if [ "$no_commit" -eq 1 ] && [ -n "$orphan_branch" ]; then
+    die "--no-commit and --orphan-branch are mutually exclusive"
+  fi
+
+  # Phase 3: ALL validation BEFORE any repo mutation
+  require_cmds gh jq git
   local repo_main
   repo_main="$(safe_repo_main "$repo")"
   local dir
   dir="$(spec_dir "$repo" "$slug")"
-
   [ -d "$dir" ] || die "Spec directory missing: $dir"
   [ -f "$dir/plans/SPEC.md" ] || die "Missing final plan: $dir/plans/SPEC.md"
 
+  # Three-artifact-mode validation (preserved verbatim from prior cmd_approve;
+  # Round 3 B1 — must NOT be dropped). Validation only — never mutates.
   local recorded_output_mode
   if recorded_output_mode="$(jq -r '.output_mode // "single"' "$dir/meta.json" 2>/dev/null)"; then
     :
@@ -2670,6 +2843,15 @@ cmd_approve() {
   issue_number="$(issue_number_from_slug "$slug")"
   [ -n "$issue_number" ] || die "Cannot infer issue number from slug: $slug"
 
+  # Phase 4: mutations
+  if [ "$no_commit" -eq 0 ]; then
+    if [ -n "$orphan_branch" ]; then
+      commit_spec_dir_on_branch "$slug" "$repo_main" "$orphan_branch"
+    else
+      commit_spec_dir "$slug" "$repo_main"
+    fi
+  fi
+
   set_issue_state_label "$repo_main" "$issue_number" "spec-approved"
   comment_issue "$repo_main" "$issue_number" "Spec approved for implementation: $dir/plans/SPEC.md"
 
@@ -2680,6 +2862,7 @@ cmd_approve() {
   # W3-4: Extract spec metadata and write to metadata.json for Foreman enrichment
   local foreman_home="${FOREMAN_HOME:-$HOME/.foreman}"
   local extract_script="${foreman_home}/bin/spec-metadata-extract.sh"
+  local metadata_written=0
   if [ -x "$extract_script" ]; then
     local meta_json
     meta_json="$(bash "$extract_script" "$dir" 2>/dev/null)" || meta_json=""
@@ -2687,10 +2870,21 @@ cmd_approve() {
       local tmp_meta="${dir}/metadata.json.tmp.$$"
       printf '%s\n' "$meta_json" > "$tmp_meta"
       mv -f "$tmp_meta" "${dir}/metadata.json"
+      metadata_written=1
     else
       local tmp_meta="${dir}/metadata.json.tmp.$$"
       printf 'null\n' > "$tmp_meta"
       mv -f "$tmp_meta" "${dir}/metadata.json"
+      metadata_written=1
+    fi
+  fi
+
+  # If we committed the spec dir AND wrote metadata, fold it into the spec commit
+  if [ "$no_commit" -eq 0 ] && [ "$metadata_written" -eq 1 ]; then
+    if [ -n "$orphan_branch" ]; then
+      info "metadata.json + spec dir live on orphan branch '$orphan_branch'; caller branch will show them as untracked"
+    else
+      amend_spec_metadata "$slug" "$repo_main"
     fi
   fi
 }
@@ -3901,8 +4095,8 @@ main() {
       cmd_status "${2:-}"
       ;;
     approve)
-      [ "$#" -eq 3 ] || { usage; exit 1; }
-      cmd_approve "$2" "$3"
+      [ "$#" -ge 3 ] || { usage; exit 1; }
+      cmd_approve "${@:2}"
       ;;
     spec-complete)
       [ "$#" -eq 3 ] || { usage; exit 1; }
