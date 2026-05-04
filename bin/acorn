@@ -2658,12 +2658,15 @@ commit_spec_dir() {
 
   info "Attempting to commit $rel on branch $target_branch (caller was on $original_branch)"
 
+  # Explicit `|| exit N` per operation. Bash's `set -e` is unreliable inside
+  # subshells (varies between if/then nesting and conditional contexts), so
+  # control flow is explicit. Distinguishable exit codes aid diagnosis.
   local rc=0
-  if ! (
-    set -e
-    cd "$repo_main"
+  set +e
+  (
+    cd "$repo_main" || exit 100
     if [ "$original_branch" != "$target_branch" ]; then
-      git checkout "$target_branch"
+      git checkout "$target_branch" || exit 101
     fi
     if git diff --quiet -- "$rel" \
        && git diff --cached --quiet -- "$rel" \
@@ -2671,20 +2674,22 @@ commit_spec_dir() {
       info "$rel already committed (idempotent skip)"
       exit 0
     fi
-    git add -- "$rel"
-    git commit -m "spec: commit ${slug} for dispatch (acorn approve)" -- "$rel"
+    git add -- "$rel" || exit 102
+    git commit -m "spec: commit ${slug} for dispatch (acorn approve)" -- "$rel" || exit 103
     info "Committed $rel on branch $target_branch"
-  ); then
-    rc=$?
-  fi
+  )
+  rc=$?
+  set -e
 
   if [ "$original_branch" != "$target_branch" ]; then
-    if ! ( cd "$repo_main" && git checkout "$original_branch" ); then
-      warn "Failed to restore branch $original_branch on $repo_main; manual intervention may be needed"
-    fi
+    set +e
+    ( cd "$repo_main" && git checkout "$original_branch" )
+    local restore_rc=$?
+    set -e
+    [ "$restore_rc" -eq 0 ] || warn "Failed to restore branch $original_branch on $repo_main; manual intervention may be needed"
   fi
 
-  [ "$rc" -eq 0 ] || die "commit_spec_dir failed for $rel"
+  [ "$rc" -eq 0 ] || die "commit_spec_dir failed for $rel (rc=$rc)"
 }
 
 # commit_spec_dir_on_branch(slug, repo_main, target_branch) -- --orphan-branch variant.
@@ -2705,13 +2710,13 @@ commit_spec_dir_on_branch() {
   info "Attempting to commit $rel on orphan branch $target_branch (caller was on $original_branch)"
 
   local rc=0
-  if ! (
-    set -e
-    cd "$repo_main"
+  set +e
+  (
+    cd "$repo_main" || exit 100
     if git show-ref --verify --quiet "refs/heads/$target_branch"; then
-      git checkout "$target_branch"
+      git checkout "$target_branch" || exit 101
     else
-      git checkout -b "$target_branch"
+      git checkout -b "$target_branch" || exit 101
     fi
     if git diff --quiet -- "$rel" \
        && git diff --cached --quiet -- "$rel" \
@@ -2719,18 +2724,20 @@ commit_spec_dir_on_branch() {
       info "$rel already committed on $target_branch (idempotent skip)"
       exit 0
     fi
-    git add -- "$rel"
-    git commit -m "spec: commit ${slug} for dispatch (acorn approve)" -- "$rel"
+    git add -- "$rel" || exit 102
+    git commit -m "spec: commit ${slug} for dispatch (acorn approve)" -- "$rel" || exit 103
     info "Committed $rel on orphan branch $target_branch"
-  ); then
-    rc=$?
-  fi
+  )
+  rc=$?
+  set -e
 
-  if ! ( cd "$repo_main" && git checkout "$original_branch" ); then
-    warn "Failed to restore branch $original_branch on $repo_main; commit may have succeeded but worktree is on $target_branch"
-  fi
+  set +e
+  ( cd "$repo_main" && git checkout "$original_branch" )
+  local restore_rc=$?
+  set -e
+  [ "$restore_rc" -eq 0 ] || warn "Failed to restore branch $original_branch on $repo_main; commit may have succeeded but worktree is on $target_branch"
 
-  [ "$rc" -eq 0 ] || die "commit_spec_dir_on_branch failed for $rel"
+  [ "$rc" -eq 0 ] || die "commit_spec_dir_on_branch failed for $rel (rc=$rc)"
 }
 
 # amend_spec_metadata(slug, repo_main) -- fold metadata.json into spec commit if HEAD matches;
@@ -2750,11 +2757,11 @@ amend_spec_metadata() {
     || die "repo_main is in detached HEAD; refusing to amend"
 
   local rc=0
-  if ! (
-    set -e
-    cd "$repo_main"
+  set +e
+  (
+    cd "$repo_main" || exit 100
     if [ "$original_branch" != "$target_branch" ]; then
-      git checkout "$target_branch"
+      git checkout "$target_branch" || exit 101
     fi
     # Idempotent guard: skip if metadata.json content matches HEAD content already
     if git ls-files --error-unmatch -- "$rel" >/dev/null 2>&1 \
@@ -2763,27 +2770,29 @@ amend_spec_metadata() {
       exit 0
     fi
     local head_subject
-    head_subject="$(git log -1 --format=%s)"
+    head_subject="$(git log -1 --format=%s)" || exit 104
     if [ "${head_subject:0:${#expected_prefix}}" = "$expected_prefix" ]; then
-      git add -- "$rel"
-      git commit --amend --no-edit -- "$rel"
+      git add -- "$rel" || exit 102
+      git commit --amend --no-edit -- "$rel" || exit 103
       info "metadata.json folded into spec commit"
     else
       warn "HEAD subject does not match spec commit; creating standalone metadata commit"
-      git add -- "$rel"
-      git commit -m "spec: metadata for ${slug}" -- "$rel"
+      git add -- "$rel" || exit 102
+      git commit -m "spec: metadata for ${slug}" -- "$rel" || exit 103
     fi
-  ); then
-    rc=$?
-  fi
+  )
+  rc=$?
+  set -e
 
   if [ "$original_branch" != "$target_branch" ]; then
-    if ! ( cd "$repo_main" && git checkout "$original_branch" ); then
-      warn "Failed to restore branch $original_branch on $repo_main"
-    fi
+    set +e
+    ( cd "$repo_main" && git checkout "$original_branch" )
+    local restore_rc=$?
+    set -e
+    [ "$restore_rc" -eq 0 ] || warn "Failed to restore branch $original_branch on $repo_main"
   fi
 
-  [ "$rc" -eq 0 ] || die "amend_spec_metadata failed for $rel"
+  [ "$rc" -eq 0 ] || die "amend_spec_metadata failed for $rel (rc=$rc)"
 }
 
 cmd_approve() {
