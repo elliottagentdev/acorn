@@ -1989,6 +1989,15 @@ validate_prompt_md() {
   if grep -E -q '__SPEC_PATH__|__RETRY_BUDGET__|__RETRY_BACKOFF__|__EVENT_PATH_DISPLAY__|__MODE__' "$prompt_path"; then
     return 1
   fi
+
+  # Enforcement hook (forge#262 /clarify pre-stage): fail loudly when enabled
+  # but pre-stage section/commands are missing from rendered PROMPT.md.
+  if [ "${ACORN_CLARIFY_ENABLED:-0}" = "1" ]; then
+    grep -q '## PRE-STAGE: /clarify (M37 substrate-critical check)' "$prompt_path" || return 1
+    grep -q 'PYTHONPATH=. python3 -m runtime.acorn.stages.clarify' "$prompt_path" || return 1
+    grep -E -q 'acorn _internal validate-stage ".*" (full|lite|quick) pre0' "$prompt_path" || return 1
+  fi
+
   return 0
 }
 
