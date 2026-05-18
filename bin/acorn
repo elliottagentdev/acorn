@@ -125,6 +125,9 @@ notify_foreman() {
 stage_manifest() {
   local mode="$1" stage="$2"
   case "$mode:$stage" in
+    full:pre0|lite:pre0|quick:pre0)
+      printf '%s\n' "${ACORN_CLARIFICATIONS_FILENAME:-clarifications.md}|^# Clarifications:"
+      ;;
     full:0|lite:0|quick:0)
       printf '%s\n' \
         'recon/architecture.md|^## Directory Structure' \
@@ -149,6 +152,7 @@ stage_manifest() {
 stage_name() {
   local mode="$1" stage="$2"
   case "$mode:$stage" in
+    *:pre0) printf 'pre-stage-0 /clarify' ;;
     *:0) printf 'recon' ;;
     full:1|lite:1) printf 'drafting' ;;
     full:2|lite:2) printf 'validation' ;;
@@ -173,6 +177,15 @@ validate_stage_artifacts() {
       printf 'HEADER|%s|%s\n' "$path" "$header" >&2; rc=1
     fi
   done <<< "$manifest"
+
+  if [ "$rc" -eq 0 ] && [ "$stage" = "pre0" ]; then
+    local clarify_file="$spec_dir/${ACORN_CLARIFICATIONS_FILENAME:-clarifications.md}"
+    if [ -f "$clarify_file" ] && grep -q "_(not yet answered)_" "$clarify_file"; then
+      printf 'SKELETON|%s|unanswered placeholders\n' "$clarify_file" >&2
+      rc=1
+    fi
+  fi
+
   return "$rc"
 }
 
@@ -195,7 +208,11 @@ halt_pipeline_diagnostic() {
   local spec_dir="$1" mode="$2" stage="$3" agent="$4" artifact="$5" halt_reason="$6" observed="$7" agent_log_tail="${8:-(no output captured)}"
   agent_log_tail="${agent_log_tail//\`\`\`/~~~}"
   local stage_dir halt_path sname slug repo issue_number session_name ts body
-  case "$stage" in 0) stage_dir="$spec_dir/recon" ;; *) stage_dir="$spec_dir/plans" ;; esac
+  case "$stage" in
+    0) stage_dir="$spec_dir/recon" ;;
+    pre*) stage_dir="$spec_dir" ;;
+    *) stage_dir="$spec_dir/plans" ;;
+  esac
   mkdir -p "$stage_dir" 2>/dev/null || true
   halt_path="$stage_dir/HALT.md"
   sname="$(stage_name "$mode" "$stage")"
@@ -290,6 +307,10 @@ Dependency management:
 
 Lifecycle labels:
   triage -> ready-for-spec -> spec-in-progress -> spec-review -> spec-approved -> implementing -> in-review -> done
+
+Environment Variables:
+  ACORN_CLARIFY_ENABLED=1                  Enable pre-Stage-0 /clarify block and gate flow
+  ACORN_CLARIFICATIONS_FILENAME=<filename> Override clarify artifact filename (default: clarifications.md)
 EOF
 }
 
@@ -1788,6 +1809,76 @@ When validation exits 0, read __SPEC_PATH__/plans/SPEC.md and present it to the 
 METHODOLOGY_EOF
 }
 
+planning_block_clarify() {
+  local spec_path="${1:-.}"
+  local mode="${2:-lite}"
+  cat <<'CLARIFY_BLOCK' \
+    | sed "s|__SPEC_PATH__|${spec_path}|g" \
+    | sed "s|__MODE__|${mode}|g"
+## PRE-STAGE: /clarify (M37 substrate-critical check)
+
+**MANDATORY BEFORE STAGE 0 RECON.**
+
+### M37 substrate-critical heuristics
+
+- **H1**: Builds mechanical enforcement infrastructure (gates, validators, schemas)
+- **H2**: Defines shared contracts used by >=2 downstream capabilities
+- **H3**: Establishes persistent state structures (state machines, event logs)
+- **H4**: Future capabilities depend on this shipping first (foundational enabler)
+- **H5**: Failure cascades across multiple systems
+<!-- TODO(M37-cite): verify H5 wording against ~/.foreman/feedback/feedback_m37_acorn_decomposition_guidance.md once accessible -->
+
+### MVP scope clarification questions
+
+1. What is the MINIMUM VIABLE function this spec ships?
+2. What is the FULL design (all functionality this spec's domain encompasses)?
+3. What is DEFERRED to expansion passes? (Enumerate explicit list)
+4. What architectural patterns support expansion? (Interfaces, plugins, strategies, extensible types, forward-compatible enums)
+5. What is the LANDING capability for deferred work? (Specific future capability or epic)
+
+### Execution
+
+1. Write `__SPEC_PATH__/clarifications.input.json`:
+
+```json
+{
+  "mode": "__MODE__",
+  "heuristics_fired": ["H2", "H4"],
+  "mvp_scope": "...",
+  "full_design": "...",
+  "deferred": ["item 1", "item 2"],
+  "arch_patterns": "...",
+  "landing_capability": "Cap G-1"
+}
+```
+
+2. Render `clarifications.md`:
+
+```bash
+PYTHONPATH=. python3 -m runtime.acorn.stages.clarify \
+  --spec-dir "__SPEC_PATH__" \
+  --input "__SPEC_PATH__/clarifications.input.json"
+```
+
+3. Run stage gate:
+
+```bash
+acorn _internal validate-stage "__SPEC_PATH__" __MODE__ pre0
+```
+
+On exhaustion (M29 hard-limit), run:
+
+```bash
+acorn _internal halt "__SPEC_PATH__" __MODE__ pre0 clarify \
+  clarifications.md CLARIFY_FAILED "validate-stage returned 1"
+```
+
+Do NOT proceed to Stage 0 until pre0 passes.
+
+---
+CLARIFY_BLOCK
+}
+
 render_comments_block() {
   local issue_json="$1"
   printf '%s\n' "$issue_json" | jq -r '
@@ -1832,6 +1923,11 @@ render_prompt_md() {
     fi
     printf '%s' "$comments_text"
     printf '\n---\n\n'
+
+    if [ "${ACORN_CLARIFY_ENABLED:-0}" = "1" ]; then
+      planning_block_clarify "$spec_path" "$mode"
+    fi
+
     planning_block "$mode" "$spec_path"
 
     if [ "$output_mode" = "three-artifact" ]; then
@@ -2180,6 +2276,13 @@ write_meta_json() {
   local ts
   ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
+  local clarify_run
+  if [ "${ACORN_CLARIFY_ENABLED:-0}" = "1" ]; then
+    clarify_run=true
+  else
+    clarify_run=false
+  fi
+
   jq -n \
     --arg repo "$repo" \
     --argjson issue_number "$issue_number" \
@@ -2190,7 +2293,8 @@ write_meta_json() {
     --arg session_name "$session_name" \
     --arg mode "$mode" \
     --arg output_mode "$output_mode" \
-    '{repo:$repo, issue_number:$issue_number, issue_title:$issue_title, slug:$slug, created_at:$created_at, session_backend:$session_backend, session_name:$session_name, mode:$mode, output_mode:$output_mode}' \
+    --argjson clarify_run "$clarify_run" \
+    '{repo:$repo, issue_number:$issue_number, issue_title:$issue_title, slug:$slug, created_at:$created_at, session_backend:$session_backend, session_name:$session_name, mode:$mode, output_mode:$output_mode, clarify_run:$clarify_run}' \
     > "$path"
 }
 
