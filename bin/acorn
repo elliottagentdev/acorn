@@ -29,11 +29,16 @@ unset _claude_bin
 auto_trigger_message() {
   local spec_path="$1"
   local mode="${2:-full}"
+  local msg
   case "$mode" in
-    full)  printf 'Read %s/PROMPT.md and follow ALL instructions in it to execute the full 6-stage planning pipeline. Start with Stage 0 (Recon). Write all output files to %s/' "$spec_path" "$spec_path" ;;
-    lite)  printf 'Read %s/PROMPT.md and follow ALL instructions in it to execute the lite 4-stage planning pipeline. Start with Stage 0 (Recon). Write all output files to %s/' "$spec_path" "$spec_path" ;;
-    quick) printf 'Read %s/PROMPT.md and follow ALL instructions in it to execute the quick 2-stage planning pipeline. Start with Stage 0 (Recon). Write all output files to %s/' "$spec_path" "$spec_path" ;;
+    full)  msg=$(printf 'Read %s/PROMPT.md and follow ALL instructions in it to execute the full 6-stage planning pipeline. Start with Stage 0 (Recon). Write all output files to %s/' "$spec_path" "$spec_path") ;;
+    lite)  msg=$(printf 'Read %s/PROMPT.md and follow ALL instructions in it to execute the lite 4-stage planning pipeline. Start with Stage 0 (Recon). Write all output files to %s/' "$spec_path" "$spec_path") ;;
+    quick) msg=$(printf 'Read %s/PROMPT.md and follow ALL instructions in it to execute the quick 2-stage planning pipeline. Start with Stage 0 (Recon). Write all output files to %s/' "$spec_path" "$spec_path") ;;
   esac
+  if [ "${ACORN_CLARIFY_ENABLED:-0}" = "1" ]; then
+    msg="${msg} IMPORTANT: PROMPT.md begins with a /clarify pre-Stage-0 block; complete it before Stage 0 Recon."
+  fi
+  printf '%s' "$msg"
 }
 
 info() { printf '[INFO] %s\n' "$*"; }
@@ -604,6 +609,60 @@ remove_blocked_by_dependency() {
     gh api --method DELETE \
       "repos/${nwo}/issues/${issue_number}/dependencies/blocked_by/${blocker_number}" >/dev/null
   ) || { warn "Failed to remove blocked-by #$blocker_number from issue #$issue_number"; return 1; }
+}
+
+_emit_pi_ship_warning() {
+  # Warning-only check for issue-body Pi-ship deps.
+  local repo="$1"
+  local slug="$2"
+  local body="$3"
+
+  local lib_dir=""
+  for candidate in \
+    "$HOME/.foreman/lib" \
+    "/mnt/e/agentdev/projects/forge/main/runtime/foreman/lib" \
+    "$HOME/projects/forge/main/runtime/foreman/lib"; do
+    if [ -f "$candidate/pi_ship_dependency.py" ]; then
+      lib_dir="$candidate"
+      break
+    fi
+  done
+  [ -n "$lib_dir" ] || return 0
+
+  local declared_json
+  declared_json="$(printf '%s' "$body" | awk '
+      BEGIN { in_section=0; in_block=0; printed=0 }
+      /^## Pi-Ship Dependencies[[:space:]]*$/ { if (!printed) { in_section=1; next } }
+      in_section && /^## / { in_section=0 }
+      in_section && /^```json[[:space:]]*$/ { in_block=1; next }
+      in_section && in_block && /^```[[:space:]]*$/ { in_block=0; printed=1; in_section=0; exit }
+      in_section && in_block { print }
+  ' 2>/dev/null || true)"
+
+  [ -n "$declared_json" ] || return 0
+  if ! printf '%s' "$declared_json" | jq -e -c '.' >/dev/null 2>&1; then
+    warn "acorn create: malformed Pi-Ship Dependencies JSON block in issue body"
+    return 0
+  fi
+  declared_json="$(printf '%s' "$declared_json" | jq -c '.')"
+
+  local projects_dir="${FORGE_PROJECTS_DIR:-${PROJECTS_DIR:-/mnt/e/agentdev/projects}}"
+  local result_json=""
+  set +e
+  result_json="$(PYTHONPATH="$lib_dir" timeout 15s python3 -m pi_ship_dependency \
+    "$slug" \
+    --declared-json "$declared_json" \
+    --repo "$repo" \
+    --worktree "${PI_SHIP_GATE_WORKTREE:-main}" \
+    --projects-dir "$projects_dir" 2>/dev/null)"
+  local ec=$?
+  set -e
+
+  if [ "$ec" -eq 1 ]; then
+    local missing
+    missing="$(printf '%s' "$result_json" | jq -r '.missing_deps[] | "  - \(.spec_id) (\(.reason))"' 2>/dev/null || true)"
+    [ -n "$missing" ] && warn "acorn create: declared Pi-ship deps not yet shipped for $slug:\n$missing"
+  fi
 }
 
 # Detect if adding "issue_number blocked-by blocker_number" would create a cycle.
@@ -1826,7 +1885,6 @@ planning_block_clarify() {
 - **H3**: Establishes persistent state structures (state machines, event logs)
 - **H4**: Future capabilities depend on this shipping first (foundational enabler)
 - **H5**: Failure cascades across multiple systems
-<!-- TODO(M37-cite): verify H5 wording against ~/.foreman/feedback/feedback_m37_acorn_decomposition_guidance.md once accessible -->
 
 ### MVP scope clarification questions
 
@@ -2646,6 +2704,8 @@ cmd_create() {
     fi
     info "PROMPT.md already exists, leaving as-is"
   fi
+
+  _emit_pi_ship_warning "$repo" "$slug" "$body"
 
   ensure_labels "$repo_main"
   set_issue_state_label "$repo_main" "$issue_number" "spec-in-progress"
