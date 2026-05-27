@@ -1267,6 +1267,8 @@ Be adversarial. Think like a chaos engineer. What breaks under stress?
 ```
 
 **After all 4 complete (Stage 4 Gate):**
+Run pre-action rt-gate (stage anchor 4.5): `acorn _internal rt-gate "__SPEC_PATH__"`.
+If rt-gate exits 0/16/42, proceed. Otherwise STOP with that exit code.
 Run stage gate via Bash: `acorn _internal validate-stage "__SPEC_PATH__" __MODE__ 4`.
 If rc=1, relaunch ONLY failed agent(s), wait `__RETRY_BACKOFF__` seconds between retries, and retry up to `__RETRY_BUDGET__` times per agent.
 On exhaustion, run `acorn _internal halt "__SPEC_PATH__" __MODE__ 4 "<agent>" "<artifact>" <halt_reason> "<observed>"` and STOP.
@@ -1514,6 +1516,8 @@ Be specific — reference actual file paths, function names, and code patterns f
 ```
 
 **After completion (Stage 1 Gate):**
+Run pre-action rt-gate (stage anchor 1.5): `acorn _internal rt-gate "__SPEC_PATH__"`.
+If rt-gate exits 0/16/42, proceed. Otherwise STOP with that exit code.
 Run stage gate via Bash: `acorn _internal validate-stage "__SPEC_PATH__" __MODE__ 1`.
 If rc=1, relaunch ONLY failed agent(s), wait `__RETRY_BACKOFF__` seconds between retries, and retry up to `__RETRY_BUDGET__` times per agent.
 On exhaustion, run `acorn _internal halt "__SPEC_PATH__" __MODE__ 1 "<agent>" "<artifact>" <halt_reason> "<observed>"` and STOP.
@@ -1781,6 +1785,8 @@ CRITICAL SUB-AGENT INSTRUCTIONS:
 ```
 
 **After all 3 complete (Recon Completeness Gate):**
+Run pre-action rt-gate (stage anchor 0.5): `acorn _internal rt-gate "__SPEC_PATH__"`.
+If rt-gate exits 0/16/42, proceed. Otherwise STOP with that exit code.
 Run stage gate via Bash: `acorn _internal validate-stage "__SPEC_PATH__" __MODE__ 0`.
 If rc=1, relaunch ONLY failed agent(s), wait `__RETRY_BACKOFF__` seconds between retries, and retry up to `__RETRY_BUDGET__` times per agent.
 On exhaustion, run `acorn _internal halt "__SPEC_PATH__" __MODE__ 0 "<agent>" "<artifact>" <halt_reason> "<observed>"` and STOP.
