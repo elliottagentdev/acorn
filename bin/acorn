@@ -1267,8 +1267,6 @@ Be adversarial. Think like a chaos engineer. What breaks under stress?
 ```
 
 **After all 4 complete (Stage 4 Gate):**
-Run pre-action rt-gate (stage anchor 4.5): `acorn _internal rt-gate "__SPEC_PATH__"`.
-If rt-gate exits 0/16/42, proceed. Otherwise STOP with that exit code.
 Run stage gate via Bash: `acorn _internal validate-stage "__SPEC_PATH__" __MODE__ 4`.
 If rc=1, relaunch ONLY failed agent(s), wait `__RETRY_BACKOFF__` seconds between retries, and retry up to `__RETRY_BUDGET__` times per agent.
 On exhaustion, run `acorn _internal halt "__SPEC_PATH__" __MODE__ 4 "<agent>" "<artifact>" <halt_reason> "<observed>"` and STOP.
@@ -1516,8 +1514,6 @@ Be specific — reference actual file paths, function names, and code patterns f
 ```
 
 **After completion (Stage 1 Gate):**
-Run pre-action rt-gate (stage anchor 1.5): `acorn _internal rt-gate "__SPEC_PATH__"`.
-If rt-gate exits 0/16/42, proceed. Otherwise STOP with that exit code.
 Run stage gate via Bash: `acorn _internal validate-stage "__SPEC_PATH__" __MODE__ 1`.
 If rc=1, relaunch ONLY failed agent(s), wait `__RETRY_BACKOFF__` seconds between retries, and retry up to `__RETRY_BUDGET__` times per agent.
 On exhaustion, run `acorn _internal halt "__SPEC_PATH__" __MODE__ 1 "<agent>" "<artifact>" <halt_reason> "<observed>"` and STOP.
@@ -1785,8 +1781,6 @@ CRITICAL SUB-AGENT INSTRUCTIONS:
 ```
 
 **After all 3 complete (Recon Completeness Gate):**
-Run pre-action rt-gate (stage anchor 0.5): `acorn _internal rt-gate "__SPEC_PATH__"`.
-If rt-gate exits 0/16/42, proceed. Otherwise STOP with that exit code.
 Run stage gate via Bash: `acorn _internal validate-stage "__SPEC_PATH__" __MODE__ 0`.
 If rc=1, relaunch ONLY failed agent(s), wait `__RETRY_BACKOFF__` seconds between retries, and retry up to `__RETRY_BUDGET__` times per agent.
 On exhaustion, run `acorn _internal halt "__SPEC_PATH__" __MODE__ 0 "<agent>" "<artifact>" <halt_reason> "<observed>"` and STOP.
@@ -4066,25 +4060,6 @@ cmd_setup_watchdog() {
 }
 
 
-redteam_universal_gate() {
-  local spec_dir="$1"
-  local slug
-  slug="$(basename "$spec_dir")"
-  local tax="${PROJECTS_DIR:-$HOME/projects}/forge/main/runtime/foreman/docs/EXIT_CODE_TAXONOMY.md"
-  if [ ! -d "$spec_dir" ]; then
-    echo "[ERROR] spec_dir missing: $spec_dir" >&2
-    return 2
-  fi
-  if [ ! -f "$tax" ]; then
-    echo "[ERROR] taxonomy missing: $tax" >&2
-    return 10
-  fi
-  local cache_root="${FOREMAN_HOME:-$HOME/.foreman}/redteam-cache"
-  if ! find "$cache_root/$slug" -name 'Findings.json' -type f 2>/dev/null | head -n1 | grep -q .; then
-    return 10
-  fi
-  return 0
-}
 
 cmd_internal() {
   local sub="${1:-}"
@@ -4093,10 +4068,6 @@ cmd_internal() {
     validate-stage)
       [ "$#" -eq 3 ] || die "Usage: acorn _internal validate-stage <spec_dir> <mode> <stage>"
       validate_stage_artifacts "$1" "$2" "$3"
-      ;;
-    rt-gate)
-      [ "$#" -eq 1 ] || die "Usage: acorn _internal rt-gate <spec_dir>"
-      redteam_universal_gate "$1"
       ;;
     halt)
       [ "$#" -ge 7 ] || die "Usage: acorn _internal halt <spec_dir> <mode> <stage> <agent> <artifact> <halt_reason> <observed> [<agent_log_tail>]"
