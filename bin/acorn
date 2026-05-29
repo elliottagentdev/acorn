@@ -2078,7 +2078,7 @@ wait_for_claude_ready() {
     # Strip any residual ANSI escape codes
     pane_content="$(printf '%s' "$pane_content" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g')"
     # Check the last few lines for Claude Code's prompt
-    if printf '%s' "$pane_content" | tail -n5 | grep -qE '>\s*$'; then
+    if printf '%s' "$pane_content" | tail -n5 | grep -qP '[│\s]*[❯>]\s*$'; then
       return 0
     fi
     sleep "$interval"
@@ -2099,8 +2099,19 @@ send_auto_trigger() {
     # prevents set -e from killing the subshell when wait_for_claude_ready returns 1)
     wait_for_claude_ready "$session_name" 30 2 || true
     tmux send-keys -t "$session_name" -l "$message"
-    sleep 1
+    # M78 fix (#397): longer settle so the literal text lands fully in the input
+    # buffer before Enter, matching the proven redteam/foreman boot timing.
+    sleep 2
     tmux send-keys -t "$session_name" Enter
+    # M78 fix (#397): post-Enter delivery re-check. If the input line still shows
+    # an un-submitted prompt glyph with text after it, the Enter did not commit;
+    # send one more bare Enter. Bounded single retry — never loops.
+    sleep 1
+    local after
+    after="$(tmux capture-pane -t "$session_name" -ep 2>/dev/null | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' | tail -n3)"
+    if printf '%s' "$after" | grep -qP '[❯>]\s*\S'; then
+      tmux send-keys -t "$session_name" Enter
+    fi
   ) &
   disown
 }
