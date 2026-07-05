@@ -506,6 +506,51 @@ test_non_integer_threshold_graceful() {
 }
 
 # ──────────────────────────────────────
+# T19: Non-number dim coerced to 0 (no crash, graceful scoring)
+# ──────────────────────────────────────
+test_enrich_complexity_non_number_dim() {
+  printf '\n\033[1m== T19: Non-number dim coerced to 0 ==\033[0m\n'
+
+  local dims='{
+    "should_split": false,
+    "reasoning": "test",
+    "sub_issues": [],
+    "complexity": {
+      "dims": {
+        "files_touched": "3",
+        "loc_estimate": 2,
+        "novelty": 2,
+        "context_depth": 2,
+        "cross_module_fan_out": 2
+      },
+      "loc_estimate_total": 100,
+      "files_estimate_total": 2,
+      "atomic_justification": null
+    }
+  }'
+
+  local result
+  set +e
+  result="$(enrich_complexity "$dims" 2>&1)"
+  local rc=$?
+  set -e
+
+  if [ "$rc" -ne 0 ]; then
+    fail "T19: non-number dim does NOT crash" "enrich_complexity exited $rc: $result"
+    return
+  fi
+  pass "T19: non-number dim does NOT crash"
+
+  local score band
+  score="$(printf '%s' "$result" | jq -r '.complexity.score')"
+  band="$(printf '%s'  "$result" | jq -r '.complexity.band')"
+
+  # files_touched="3" (string) -> coerced to 0; rest are 2+2+2+2=8; total=8
+  assert_eq "T19: score=8 (string dim->0)" "$score" "8"
+  assert_eq "T19: band=MED" "$band" "MED"
+}
+
+# ──────────────────────────────────────
 # Run all tests
 # ──────────────────────────────────────
 setup
@@ -527,6 +572,7 @@ test_planning_blocks_contain_scoring
 test_validate_prompt_md_sentinel
 test_stage_manifest_spec_gate
 test_non_integer_threshold_graceful
+test_enrich_complexity_non_number_dim
 
 teardown
 

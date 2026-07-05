@@ -3384,7 +3384,7 @@ enrich_complexity() {
       .complexity.dims.novelty,
       .complexity.dims.context_depth,
       .complexity.dims.cross_module_fan_out ]
-    | map(. // 0) | add')"
+    | map(if type=="number" then . else 0 end) | add')"
   case "$score" in ''|*[!0-9]*) score=0 ;; esac
   band="$(complexity_band "$score")"
 
