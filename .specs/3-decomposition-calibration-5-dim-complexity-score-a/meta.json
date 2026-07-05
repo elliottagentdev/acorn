@@ -1,0 +1,11 @@
+{
+  "repo": "elliottagentdev/acorn",
+  "issue_number": 3,
+  "issue_title": "Decomposition-calibration: 5-dim complexity score at spec time plus HIGH-must-propose-decomposition plus LOC-files thresholds",
+  "slug": "3-decomposition-calibration-5-dim-complexity-score-a",
+  "created_at": "2026-07-05T22:14:11Z",
+  "session_backend": "tmux",
+  "session_name": "elliottagentdev_acorn_specs_3-decomposition-calibration-5-dim-complexity-score-a_claude",
+  "mode": "lite",
+  "output_mode": "single"
+}
