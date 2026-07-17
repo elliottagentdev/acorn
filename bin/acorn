@@ -376,6 +376,29 @@ issue_number_from_slug() {
   printf '%s' "$slug" | sed -nE 's/^([0-9]+)-.*/\1/p'
 }
 
+# forge-841: meta-fallback issue resolution -- keep discrete, port forward intact.
+# Resolve an issue number for a spec: prefer the slug's leading digits (byte-identical
+# to issue_number_from_slug for numbered slugs); fall back to meta.json .issue_number
+# for issue-less slugs that were later issue-stamped. Returns empty when neither source
+# yields a valid (non-zero, integer) issue number, so callers die exactly as before.
+resolve_issue_number() {
+  local slug="$1"
+  local spec_dir="$2"
+  local num
+  num="$(issue_number_from_slug "$slug")"
+  if [ -z "$num" ] && [ -f "$spec_dir/meta.json" ]; then
+    num="$(jq -r '.issue_number // ""' "$spec_dir/meta.json" 2>/dev/null || printf '')"
+    # Guard on jq OUTPUT: reject empty/null/0 and non-digits (negative, fractional,
+    # non-numeric). With jq-1.6 canonicalization, 67.0 and "67" emit as 67 and pass.
+    # If jq-1.7+ changes that canonicalization, this fails closed (empty->die) and
+    # test_c5a regresses loudly-but-safely.
+    case "$num" in
+      ''|0|*[!0-9]*) num="" ;;
+    esac
+  fi
+  printf '%s' "$num"
+}
+
 truncate_str() {
   local str="$1"
   local max_len="${2:-40}"
@@ -2343,7 +2366,7 @@ list_specs_for_repo() {
     local slug
     slug="$(basename "$dir")"
     local issue
-    issue="$(issue_number_from_slug "$slug")"
+    issue="$(resolve_issue_number "$slug" "$dir")"
     local status
     status="$(status_for_spec "$repo_main" "$issue" "$dir")"
     local clarify
@@ -2419,7 +2442,7 @@ list_status_for_repo() {
     state="$(session_state "$session_name" "$has_meta")"
 
     local issue
-    issue="$(issue_number_from_slug "$slug")"
+    issue="$(resolve_issue_number "$slug" "$dir")"
     local pipeline_status
     pipeline_status="$(status_for_spec "$repo_main" "$issue" "$dir")"
 
@@ -2860,7 +2883,7 @@ cmd_approve() {
   fi
 
   local issue_number
-  issue_number="$(issue_number_from_slug "$slug")"
+  issue_number="$(resolve_issue_number "$slug" "$dir")"
   [ -n "$issue_number" ] || die "Cannot infer issue number from slug: $slug"
 
   # Phase 4: mutations
@@ -2935,7 +2958,7 @@ cmd_spec_complete() {
   fi
 
   local issue_number
-  issue_number="$(issue_number_from_slug "$slug")"
+  issue_number="$(resolve_issue_number "$slug" "$dir")"
   [ -n "$issue_number" ] || die "Cannot infer issue number from slug: $slug"
 
   ensure_labels "$repo_main"
@@ -3007,7 +3030,7 @@ cmd_clean() {
   # Safety check: refuse to delete specs that haven't been implemented yet
   if [ "$force" -ne 1 ] && [ -f "$target/plans/SPEC.md" ]; then
     local issue_number
-    issue_number="$(issue_number_from_slug "$slug")"
+    issue_number="$(resolve_issue_number "$slug" "$target")"
     local issue_state="unknown"
     if [ -n "$issue_number" ]; then
       issue_state="$(gh issue view "$issue_number" --repo "$(gh_repo_nwo "$repo_main")" --json state -q '.state' 2>/dev/null || printf 'unknown')"
@@ -3048,7 +3071,7 @@ cmd_clean() {
   if [ "$remove_labels" -eq 1 ]; then
     require_cmds gh
     local issue_number
-    issue_number="$(issue_number_from_slug "$slug")"
+    issue_number="$(resolve_issue_number "$slug" "$target")"
     if [ -n "$issue_number" ]; then
       local label
       for label in "${LIFECYCLE_LABELS[@]}" "${CLARIFICATION_LABELS[@]}"; do
